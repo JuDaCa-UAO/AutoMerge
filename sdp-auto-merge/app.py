@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import math
 import re
+from typing import Any, Dict, List
+
 import streamlit as st
 
 from servicedesk_merge.config import load_settings, SettingsError
 from servicedesk_merge.sdp_client import ServiceDeskClient, ServiceDeskApiError
-from servicedesk_merge.ai_gpt import group_tickets_with_ai, AIError
+from servicedesk_merge.ai_gpt import refine_candidate_groups_with_ai, AIError
+from servicedesk_merge.heuristic_helper import (
+    build_candidate_groups,
+    normalize_subject,
+    requester_is_servicedesk,
+    status_is_open,
+    technician_is_unassigned,
+)
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-UNASSIGNED_VALUES = {"", "unassigned", "none", "null", "-", "n/a", "na"}
 
 
 # ----------------------------- Helpers -----------------------------
@@ -84,6 +92,13 @@ def derive_sites_from_tickets(tickets: list[dict]) -> list[str]:
     return sorted({t.get("site", "").strip() for t in tickets if t.get("site", "").strip()})
 
 
+def _to_int_id(x: str) -> int:
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return 10**18
+
+
 def remove_ids_from_list(tickets: list[dict], ids_to_remove: set[str]) -> list[dict]:
     return [t for t in tickets if str(t.get("id", "")).strip() not in ids_to_remove]
 
@@ -114,17 +129,16 @@ def refresh_parent_from_api(client: ServiceDeskClient, parent_id: str) -> dict |
 
 
 def apply_merge_local_update(client: ServiceDeskClient, site_name: str, parent_id: str, child_ids: list[str]) -> None:
-    """
-    - Quita hijos mergeados del pool general y del listado del sitio (en caliente)
-    - Refresca padre desde API y lo actualiza localmente
-    """
     parent_id = str(parent_id).strip()
     child_set = {str(x).strip() for x in child_ids if str(x).strip()}
     child_set.discard(parent_id)
 
     pool = st.session_state.get("pool_data", []) or []
     src_pool = st.session_state.get("site_source_pool", []) or pool
-    site_list = st.session_state.get("site_tickets", []) or []
+
+    # site cache (por sitio)
+    site_cache: Dict[str, List[dict]] = st.session_state.get("site_cache", {}) or {}
+    site_list = site_cache.get(site_name, []) or []
 
     pool = remove_ids_from_list(pool, child_set)
     src_pool = remove_ids_from_list(src_pool, child_set)
@@ -139,482 +153,211 @@ def apply_merge_local_update(client: ServiceDeskClient, site_name: str, parent_i
 
     st.session_state["pool_data"] = pool
     st.session_state["site_source_pool"] = src_pool
-    st.session_state["site_tickets"] = site_list
+    site_cache[site_name] = site_list
+    st.session_state["site_cache"] = site_cache
 
 
-def update_ai_groups_after_merge(parent_id: str, child_ids: list[str]) -> None:
+def update_groups_after_merge(site_name: str, parent_id: str, child_ids: list[str]) -> None:
     """
-    Remapea grupos IA localmente sin volver a llamar GPT:
-    - elimina hijos mergeados del resto de grupos
-    - marca grupo como MERGED_DONE si aplica
+    Remapea grupos IA localmente sin volver a llamar IA.
     """
-    groups = st.session_state.get("ai_groups")
-    if not isinstance(groups, list) or not groups:
-        return
-
-    parent_id = str(parent_id).strip()
     merged_children = {str(x).strip() for x in child_ids if str(x).strip()}
-    merged_children.discard(parent_id)
+    merged_children.discard(str(parent_id).strip())
+
+    all_groups_by_site: Dict[str, List[dict]] = st.session_state.get("ai_groups_by_site", {}) or {}
+    groups = all_groups_by_site.get(site_name, []) or []
 
     new_groups = []
     for g in groups:
         if not isinstance(g, dict):
             continue
-
-        reason = str(g.get("reason", "") or "")
         g_parent = str(g.get("parent_id", "") or "").strip()
         g_children = [str(x).strip() for x in (g.get("child_ids") or []) if str(x).strip()]
+        g_children = [c for c in g_children if c not in merged_children and c != g_parent]
 
-        g_children_filtered = [cid for cid in g_children if cid not in merged_children]
-
-        if g_parent == parent_id:
-            g2 = dict(g)
-            g2["child_ids"] = g_children_filtered
-            g2["merged_done"] = True
-            if "MERGED_DONE" not in g2.get("reason", ""):
-                g2["reason"] = f"{reason} | MERGED_DONE"
-            new_groups.append(g2)
-            continue
-
+        # si el padre fue mergeado como hijo en otra operación, marcar para revisión (no borramos)
         if g_parent in merged_children:
             g2 = dict(g)
-            g2["child_ids"] = g_children_filtered
-            g2["merged_done"] = True
-            if "PARENT_WAS_MERGED_REVIEW" not in g2.get("reason", ""):
-                g2["reason"] = f"{reason} | PARENT_WAS_MERGED_REVIEW"
+            g2["child_ids"] = g_children
+            g2["reason"] = (g2.get("reason", "") or "") + " | PARENT_WAS_MERGED_REVIEW"
             new_groups.append(g2)
             continue
 
         g2 = dict(g)
-        g2["child_ids"] = g_children_filtered
+        g2["child_ids"] = g_children
         new_groups.append(g2)
 
-    st.session_state["ai_groups"] = new_groups
+    all_groups_by_site[site_name] = new_groups
+    st.session_state["ai_groups_by_site"] = all_groups_by_site
 
 
-def _to_int_id(x: str) -> int:
-    try:
-        return int(str(x).strip())
-    except Exception:
-        return 10**18
+def eligible_for_ai(t: dict) -> bool:
+    return (
+        status_is_open(t.get("status", ""))
+        and technician_is_unassigned(t.get("technician", ""))
+        and requester_is_servicedesk(t.get("requester", ""))
+    )
 
 
-def _extract_last_octets(subject: str) -> list[int]:
-    ips = IP_RE.findall(subject or "")
-    out = []
-    for ip in ips:
-        parts = ip.split(".")
-        if len(parts) == 4:
-            try:
-                out.append(int(parts[3]))
-            except Exception:
-                pass
-    return out
+def compact_ticket_for_ai(t: dict) -> dict:
+    return {
+        "id": str(t.get("id", "")).strip(),
+        "subject": str(t.get("subject", "")).strip(),
+        "created": str(t.get("created", "")).strip(),
+        "status": str(t.get("status", "")).strip(),
+        "requester": str(t.get("requester", "")).strip(),
+        "technician": str(t.get("technician", "")).strip(),
+    }
 
 
-def _device_rank(ticket: dict) -> int:
+# ----------------------------- Manual board UI -----------------------------
+def render_manual_multimerge_board(
+    *,
+    client: ServiceDeskClient,
+    selected_site: str,
+    site_tickets: list[dict],
+) -> None:
     """
-    Menor rank = más arriba en jerarquía (mejor candidato a padre)
-    Router (0) -> Switch100/Core (1) -> Switch secundario (2) -> Radio (3) -> Switch terciario (4) -> Endpoint (5) -> Unknown (6)
+    Multi-merge manual:
+    - por defecto te muestra solo Open+Unassigned
+    - puedes incluir asignados si lo necesitas (checkbox)
     """
-    subj = (ticket.get("subject") or "").lower()
-    octets = _extract_last_octets(subj)
+    st.markdown("### 📌 Compilado (todos los tickets del sitio) + Multi-merge manual")
 
-    if "router" in subj or "gateway" in subj or "gw" in subj:
-        return 0
+    include_assigned = st.checkbox(
+        "Incluir tickets con technician asignado (solo para merge manual)",
+        value=False,
+        key=f"include_assigned__{selected_site}",
+        help="La IA seguirá siendo estricta, pero tú puedes mergear manualmente si lo necesitas.",
+    )
 
-    # .10x => 100-109 (Switch 100/Core)
-    if any(100 <= o <= 109 for o in octets) or "switch 100" in subj or "sw100" in subj or "core switch" in subj:
-        return 1
-
-    # Switch secundario (SM)
-    if "switch" in subj or " sm" in subj or subj.startswith("sm ") or "sm down" in subj or "sig-sm" in subj:
-        return 2
-
-    if "radio" in subj:
-        return 3
-
-    if "tertiary" in subj or "tercer" in subj or "access switch" in subj or "switch 3" in subj or "sw3" in subj:
-        return 4
-
-    if "camera" in subj or " cam" in subj or "ap " in subj or " ap" in subj or "nvr" in subj or "da " in subj:
-        return 5
-
-    return 6
-
-
-def normalize_groups_choose_parent(groups: list[dict], tickets: list[dict]) -> list[dict]:
-    """
-    Reescribe parent_id usando:
-    1) Jerarquía (device_rank más bajo)
-    2) Desempate: ID numéricamente menor (más viejo)
-    """
-    by_id = {str(t.get("id")): t for t in tickets}
-    new_groups: list[dict] = []
-
-    for g in groups or []:
-        if not isinstance(g, dict):
-            continue
-
-        parent_id = str(g.get("parent_id", "") or "").strip()
-        child_ids = [str(x).strip() for x in (g.get("child_ids") or []) if str(x).strip()]
-
-        ids = []
-        if parent_id:
-            ids.append(parent_id)
-        ids.extend(child_ids)
-
-        uniq = []
-        for x in ids:
-            if x and x not in uniq and x in by_id:
-                uniq.append(x)
-
-        if len(uniq) < 2:
-            continue
-
-        best = None
-        best_key = None
-        for tid in uniq:
-            t = by_id.get(tid, {})
-            key = (_device_rank(t), _to_int_id(tid))
-            if best is None or key < best_key:
-                best = tid
-                best_key = key
-
-        new_parent = best
-        new_children = [x for x in uniq if x != new_parent]
-
-        g2 = dict(g)
-        g2["parent_id"] = new_parent
-        g2["child_ids"] = new_children
-        new_groups.append(g2)
-
-    return new_groups
-
-
-def build_default_best_parent(all_ids: list[str], by_id: dict[str, dict]) -> str | None:
-    """
-    Sugiere un padre por jerarquía (y desempate por ID menor) para el tablero manual.
-    """
-    best = None
-    best_key = None
-    for tid in all_ids:
-        t = by_id.get(tid, {})
-        key = (_device_rank(t), _to_int_id(tid))
-        if best is None or key < best_key:
-            best = tid
-            best_key = key
-    return best
-
-
-def _norm(s: str) -> str:
-    return str(s or "").strip().lower()
-
-
-def is_open(ticket: dict) -> bool:
-    return _norm(ticket.get("status", "")) == "open"
-
-
-def is_unassigned(ticket: dict) -> bool:
-    tech = _norm(ticket.get("technician", ""))
-    return tech in UNASSIGNED_VALUES
-
-
-def is_merge_eligible(ticket: dict) -> bool:
-    return is_open(ticket) and is_unassigned(ticket)
-
-
-def split_tickets_eligible(tickets: list[dict]) -> tuple[list[dict], list[dict]]:
-    eligible = [t for t in tickets if is_merge_eligible(t)]
-    non_eligible = [t for t in tickets if not is_merge_eligible(t)]
-    return eligible, non_eligible
-
-
-def render_manual_multimerge_board(*, client: ServiceDeskClient, selected_site: str, site_tickets: list[dict]) -> None:
-    """
-    Tablero manual SIEMPRE visible:
-    - Por defecto: Open + Unassigned (lo que más te interesa)
-    - Opcional: incluir technician asignado (override)
-    - Selección rápida por tabla: seleccionar filas y usar botones para setear padre / añadir hijos
-    - Multi-merge: varios padres y asignar hijos por padre
-    """
-
-    st.markdown("## 📌 Compilado + Multi-merge manual (sin IA)")
-
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        open_only = st.checkbox("Solo status Open", value=True, key=f"mm_open_only__{selected_site}")
-    with c2:
-        include_assigned = st.checkbox(
-            "Incluir tickets con technician asignado (override)",
-            value=False,
-            key=f"mm_include_assigned__{selected_site}",
-        )
-    with c3:
-        st.caption("Tip: selecciona filas en la tabla y usa los botones para PADRE/HIJOS.")
-
+    # Scope para merge manual (para que sea práctico)
     if include_assigned:
-        st.warning(
-            "Override activo: estás incluyendo tickets con technician asignado. "
-            "Úsalo solo cuando estés seguro."
-        )
-        confirm_override = st.checkbox(
-            "Confirmo que quiero permitir merges incluyendo tickets asignados",
-            value=False,
-            key=f"mm_confirm_override__{selected_site}",
-        )
+        manual_scope = [t for t in site_tickets if (t.get("status", "").strip().lower() == "open")]
     else:
-        confirm_override = True
+        manual_scope = [t for t in site_tickets if eligible_for_ai(t)]
 
-    # ---- construir universo para merge manual ----
-    def _ok_open(t: dict) -> bool:
-        return (not open_only) or (_norm(t.get("status", "")) == "open")
+    excluded_count = len(site_tickets) - len(manual_scope)
+    st.caption(f"Tickets disponibles en tablero manual: {len(manual_scope)} (excluidos por filtros: {excluded_count})")
 
-    def _ok_assigned(t: dict) -> bool:
-        if include_assigned:
-            return True
-        return is_unassigned(t)
+    compiled = sorted(manual_scope, key=lambda t: _to_int_id(t.get("id", "")))
+    st.dataframe(compiled, use_container_width=True, height=300)
 
-    merge_universe = [t for t in site_tickets if _ok_open(t) and _ok_assigned(t)]
-    info_nonmerge = [t for t in site_tickets if t not in merge_universe]
-
-    # ---- tablas ----
-    if not merge_universe:
-        st.warning("No hay tickets que cumplan el filtro actual para merge manual.")
-    else:
-        compiled = sorted(merge_universe, key=lambda t: _to_int_id(t.get("id", "")))
-        st.dataframe(
-            compiled,
-            use_container_width=True,
-            height=340,
-            selection_mode="multi-row",
-            on_select="rerun",
-            key=f"mm_table__{selected_site}",
-        )
-
-    with st.expander("ℹ️ Informativo (fuera del filtro actual)", expanded=False):
-        st.caption(
-            "Estos tickets NO están en el universo actual de merge (por status o technician). "
-            "Útiles para ver si un incidente automático ya lo está manejando alguien."
-        )
-        if info_nonmerge:
-            st.dataframe(
-                sorted(info_nonmerge, key=lambda t: _to_int_id(t.get("id", ""))),
-                use_container_width=True,
-                height=240,
-            )
-        else:
-            st.info("Nada fuera del filtro actual.")
-
-    if len(merge_universe) < 2:
+    all_ids = [str(t.get("id")) for t in compiled if str(t.get("id", "")).strip()]
+    if len(all_ids) < 2:
+        st.info("No hay suficientes tickets en el scope actual para hacer merges manuales.")
         return
 
-    all_ids = [str(t.get("id")) for t in merge_universe if str(t.get("id", "")).strip()]
-    by_id = {str(t.get("id")): t for t in merge_universe}
+    # Plan por sitio
+    plan_by_site: Dict[str, Dict[str, List[str]]] = st.session_state.get("manual_plan_by_site", {}) or {}
+    plan = plan_by_site.get(selected_site, {}) or {}
 
-    # ---- mantener plan ----
-    plan_key = f"manual_plan__{selected_site}"
     parents_key = f"manual_parents__{selected_site}"
-    active_parent_key = f"manual_active_parent__{selected_site}"
-
-    plan: dict[str, list[str]] = st.session_state.get(plan_key, {}) or {}
-
-    # sugerencia de padre inicial
-    suggested_parent = build_default_best_parent(all_ids, by_id)
-    default_parents = [suggested_parent] if suggested_parent in all_ids else []
 
     parents = st.multiselect(
         "Selecciona uno o varios PADRES",
-        options=sorted(all_ids, key=_to_int_id),
-        default=default_parents,
+        options=all_ids,
+        default=[p for p in plan.keys() if p in all_ids],
         key=parents_key,
     )
 
-    # limpiar plan de padres no presentes
+    # limpiar plan si quitaron padres (NO tocar session_state del widget, solo el plan)
     plan = {p: kids for p, kids in plan.items() if p in parents}
 
-    if parents:
-        # padre activo (sobre el que “trabajas” al añadir hijos)
-        if st.session_state.get(active_parent_key) not in parents:
-            st.session_state[active_parent_key] = parents[0]
-
-        active_parent = st.selectbox(
-            "Padre activo (los seleccionados se agregan como hijos aquí)",
-            options=parents,
-            index=parents.index(st.session_state.get(active_parent_key, parents[0])),
-            key=active_parent_key,
-        )
-    else:
-        active_parent = None
-
-    # ---- leer selección de filas de la tabla ----
-    selected_ids: list[str] = []
-    sel_state = st.session_state.get(f"mm_table__{selected_site}")
-    # En Streamlit, la selección queda en sel_state["selection"]["rows"] o sel_state.selection.rows
-    try:
-        rows_idx = sel_state.selection.rows  # type: ignore[attr-defined]
-    except Exception:
-        rows_idx = None
-
-    if rows_idx is None:
-        # fallback (según versión)
-        try:
-            rows_idx = (sel_state.get("selection") or {}).get("rows")
-        except Exception:
-            rows_idx = []
-
-    if rows_idx and merge_universe:
-        # la tabla muestra `compiled` (ordenado). reconstruimos mismo orden:
-        compiled = sorted(merge_universe, key=lambda t: _to_int_id(t.get("id", "")))
-        for idx in rows_idx:
-            if 0 <= int(idx) < len(compiled):
-                selected_ids.append(str(compiled[int(idx)].get("id")))
-
-    # ---- Acciones rápidas: padre / hijos usando selección ----
-    st.markdown("### Acciones rápidas (usando selección de la tabla)")
-
-    a1, a2, a3, a4 = st.columns([1, 1, 1, 2])
-    with a1:
-        btn_set_parent = st.button("⭐ Usar seleccionado como PADRE", disabled=(len(selected_ids) != 1))
-    with a2:
-        btn_add_children = st.button("➕ Agregar seleccionados como HIJOS", disabled=(not active_parent or not selected_ids))
-    with a3:
-        btn_remove_children = st.button("➖ Quitar seleccionados de HIJOS", disabled=(not active_parent or not selected_ids))
-    with a4:
-        st.caption(f"Seleccionados: {', '.join(selected_ids) if selected_ids else '(nada)'}")
-
-    if btn_set_parent:
-        # cambia el padre activo y lo añade a lista de padres si no estaba
-        pid = selected_ids[0]
-        if pid not in parents:
-            parents = [pid] + parents
-            st.session_state[parents_key] = parents
-        st.session_state[active_parent_key] = pid
-        st.rerun()
-
-    if btn_add_children and active_parent:
-        kids = set(plan.get(active_parent, []))
-        for sid in selected_ids:
-            if sid == active_parent:
-                continue
-            # no permitir que un hijo sea padre de otro a la vez
-            if sid in parents:
-                continue
-            kids.add(sid)
-        plan[active_parent] = sorted(kids, key=_to_int_id)
-        st.session_state[plan_key] = plan
-        st.rerun()
-
-    if btn_remove_children and active_parent:
-        kids = set(plan.get(active_parent, []))
-        for sid in selected_ids:
-            kids.discard(sid)
-        plan[active_parent] = sorted(kids, key=_to_int_id)
-        st.session_state[plan_key] = plan
-        st.rerun()
-
-    # ---- UI de asignación tradicional por padre (opcional, para ver/editar rápido) ----
-    with st.expander("Editar plan manual (vista detallada)", expanded=False):
-        used_children = set()
-        for p, kids in plan.items():
-            for k in kids:
-                used_children.add(k)
-
-        for p in parents:
-            other_parents = set(parents) - {p}
-            available = [
-                x
-                for x in all_ids
-                if x != p and x not in other_parents and x not in (used_children - set(plan.get(p, [])))
-            ]
-            current = [x for x in plan.get(p, []) if x in available]
-
-            kids = st.multiselect(
-                f"Hijos para el padre {p}",
-                options=sorted(available, key=_to_int_id),
-                default=sorted(current, key=_to_int_id),
-                key=f"manual_children__{selected_site}__{p}",
-            )
-            plan[p] = kids
-
-        st.session_state[plan_key] = plan
-
-    # ---- Resumen ----
-    st.markdown("### Resumen del plan de merges")
-    summary_rows = []
+    # evitar hijos repetidos en distintos padres
+    used_children = set()
     for p, kids in plan.items():
-        if kids:
-            summary_rows.append({"parent": p, "children_count": len(kids), "children": ", ".join(sorted(kids, key=_to_int_id))})
+        for k in kids:
+            used_children.add(k)
 
-    if summary_rows:
-        st.dataframe(summary_rows, use_container_width=True, height=180)
+    st.markdown("#### Asignación de hijos por cada padre")
+    for p in parents:
+        other_parents = set(parents) - {p}
+        current = [x for x in (plan.get(p, []) or []) if x in all_ids]
+
+        available = [
+            x for x in all_ids
+            if x != p and x not in other_parents and x not in (used_children - set(current))
+        ]
+
+        # limpiar current con available
+        current = [x for x in current if x in available]
+
+        kids = st.multiselect(
+            f"Hijos para el padre {p}",
+            options=available,
+            default=current,
+            key=f"manual_children__{selected_site}__{p}",
+        )
+
+        # actualizar used_children
+        for x in plan.get(p, []) or []:
+            used_children.discard(x)
+        for x in kids:
+            used_children.add(x)
+
+        plan[p] = kids
+
+    plan_by_site[selected_site] = plan
+    st.session_state["manual_plan_by_site"] = plan_by_site
+
+    st.markdown("#### Resumen del plan")
+    summary = [{"parent": p, "children": ", ".join(kids), "children_count": len(kids)} for p, kids in plan.items() if kids]
+    if summary:
+        st.dataframe(summary, use_container_width=True, height=160)
     else:
         st.info("Aún no has asignado hijos a ningún padre.")
 
-    cL, cR = st.columns([1, 1])
-    with cL:
-        if st.button("🧹 Limpiar plan", type="secondary", key=f"manual_clear__{selected_site}"):
-            st.session_state[plan_key] = {}
-            st.session_state[parents_key] = []
-            st.session_state[active_parent_key] = None
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if st.button("🧹 Limpiar plan manual", type="secondary", key=f"clear_plan__{selected_site}"):
+            plan_by_site[selected_site] = {}
+            st.session_state["manual_plan_by_site"] = plan_by_site
             st.rerun()
 
-    with cR:
-        run_all = st.button(
-            "🚀 Ejecutar merges del plan",
+    with c2:
+        if st.button(
+            "🚀 Ejecutar merges del plan manual",
             type="primary",
-            key=f"manual_run_all__{selected_site}",
-            disabled=(not bool(summary_rows) or not confirm_override),
-        )
+            key=f"run_plan__{selected_site}",
+            disabled=not bool(summary),
+        ):
+            ok, fail = 0, 0
+            # ejecutar en orden por ID (más viejo primero)
+            operations = [(p, plan[p]) for p in plan.keys() if plan.get(p)]
+            operations.sort(key=lambda x: _to_int_id(x[0]))
 
-    if run_all:
-        def parent_sort_key(pid: str):
-            t = by_id.get(pid, {})
-            return (_device_rank(t), _to_int_id(pid))
+            current_ids = {str(t.get("id")) for t in site_tickets}
+            for parent_id, child_ids in operations:
+                child_ids = [c for c in child_ids if c in current_ids and c != parent_id]
+                if not child_ids:
+                    continue
 
-        operations = [(p, plan[p]) for p in plan.keys() if plan.get(p)]
-        operations.sort(key=lambda x: parent_sort_key(x[0]))
+                try:
+                    _res = client.merge_requests(parent_id=parent_id, child_ids=child_ids)
+                    ok += 1
 
-        ok_count = 0
-        fail_count = 0
+                    apply_merge_local_update(client, selected_site, parent_id, child_ids)
+                    update_groups_after_merge(selected_site, parent_id, child_ids)
 
-        # universo actual (por si cambió)
-        current_ids = {str(t.get("id")) for t in merge_universe}
+                    # actualizar universe local (para siguientes operaciones)
+                    current_ids -= set(child_ids)
 
-        for parent_id, child_ids in operations:
-            # filtrar niños existentes y válidos
-            child_ids = [c for c in child_ids if c in current_ids and c != parent_id]
-            if not child_ids:
-                continue
+                except ServiceDeskApiError as e:
+                    fail += 1
+                    st.error(f"Fallo merge padre={parent_id} hijos={child_ids}\n{e}")
 
-            try:
-                client.merge_requests(parent_id=parent_id, child_ids=child_ids)
-                ok_count += 1
+            st.success(f"Listo. Merges OK: {ok}, fallidos: {fail}")
 
-                apply_merge_local_update(client, selected_site, parent_id, child_ids)
-                update_ai_groups_after_merge(parent_id, child_ids)
-
-                # actualizar universo para evitar re-merge
-                for c in child_ids:
-                    current_ids.discard(c)
-
-            except ServiceDeskApiError as e:
-                fail_count += 1
-                st.error(f"Fallo merge padre={parent_id} hijos={child_ids}\n{e}")
-
-        st.success(f"Listo. Merges OK: {ok_count}, fallidos: {fail_count}")
-
-        # limpiar plan tras ejecutar
-        st.session_state[plan_key] = {}
-        st.session_state[parents_key] = []
-        st.session_state[active_parent_key] = None
-        st.rerun()
-
+            # limpiar plan del sitio (sin tocar widget keys)
+            plan_by_site[selected_site] = {}
+            st.session_state["manual_plan_by_site"] = plan_by_site
+            st.rerun()
 
 
 # ----------------------------- UI -----------------------------
-st.set_page_config(page_title="SDP Loader + IA", layout="wide")
-st.title("SDP Loader + IA")
+st.set_page_config(page_title="SDP Auto-Merge (Hybrid)", layout="wide")
+st.title("SDP Auto-Merge (Heurístico + IA)")
 
 try:
     settings = load_settings()
@@ -630,7 +373,7 @@ except SettingsError as e:
     st.info("Crea un .env basado en .env.example y vuelve a ejecutar.")
     st.stop()
 
-tab_pool, tab_site = st.tabs(["📥 Pool general", "🏢 Por sitio + IA + merge"])
+tab_pool, tab_site = st.tabs(["📥 Pool general", "🏢 Por sitio (híbrido)"])
 
 # ---------------- TAB 1 ----------------
 with tab_pool:
@@ -650,8 +393,8 @@ with tab_pool:
         try:
             st.session_state["pool_data"] = fetch_pool(client, int(pool_size), int(page_size), int(start_index))
             st.session_state["site_source_pool"] = st.session_state["pool_data"]
-            st.session_state["site_tickets"] = []
-            st.session_state["ai_groups"] = []
+            st.session_state["site_cache"] = {}  # cache por sitio
+            st.success("Pool cargado.")
         except (ServiceDeskApiError, ValueError) as e:
             st.error(str(e))
 
@@ -668,8 +411,7 @@ with tab_pool:
 
 # ---------------- TAB 2 ----------------
 with tab_site:
-    st.subheader("Por sitio + merge manual (siempre) + IA (opcional)")
-    st.info("El dropdown de sitios se deriva del pool cargado (sin llamar /sites).")
+    st.subheader("Por sitio (heurístico + IA) + merge revisado")
 
     src_pool = st.session_state.get("site_source_pool", [])
     if not src_pool:
@@ -683,65 +425,88 @@ with tab_site:
 
     selected_site = st.selectbox("Selecciona un sitio", options=sites)
 
-    cA, cB, cC = st.columns([1, 1, 1])
-    with cA:
-        max_to_show = st.number_input("Máximo a mostrar en tabla", min_value=50, max_value=10000, value=2000, step=50)
-    with cB:
-        show_site_table = st.checkbox("Mostrar tabla completa del sitio", value=True)
-    with cC:
-        refresh_now = st.button("🔄 Refrescar lista del sitio")
+    # cargar tickets del sitio desde cache o desde pool
+    site_cache: Dict[str, List[dict]] = st.session_state.get("site_cache", {}) or {}
+    if selected_site not in site_cache:
+        site_cache[selected_site] = [t for t in src_pool if t.get("site") == selected_site]
+        st.session_state["site_cache"] = site_cache
 
-    # Auto-carga al seleccionar sitio (y también si presionas refrescar)
-    site_all = [t for t in src_pool if t.get("site") == selected_site]
-    if refresh_now or st.session_state.get("site_loaded_for") != selected_site:
-        st.session_state["site_loaded_for"] = selected_site
-        st.session_state["site_tickets"] = site_all[: int(max_to_show)]
-        st.session_state["ai_groups"] = []  # grupos IA dependen del universo actual (pero NO llamamos IA)
-
-    site_tickets = st.session_state.get("site_tickets", [])
+    site_tickets = site_cache.get(selected_site, []) or []
     if not site_tickets:
-        st.warning("No hay tickets en este sitio dentro del pool actual.")
+        st.info("Este sitio no tiene tickets en el pool cargado.")
         st.stop()
 
-    st.success(f"Tickets en '{selected_site}': {len(site_all)} (mostrando {len(site_tickets)})")
+    st.markdown("### Tickets del sitio (referencia)")
+    st.dataframe(sorted(site_tickets, key=lambda t: _to_int_id(t.get("id", ""))), use_container_width=True, height=280)
 
-    if show_site_table:
-        st.markdown("### Tickets del sitio (tal cual vienen del pool)")
-        st.dataframe(site_tickets, use_container_width=True, height=420)
-
-    # ✅ SIEMPRE mostrar primero el tablero manual (compilado) sin necesidad de IA
     st.divider()
+
+    # 1) SIEMPRE mostrar tablero manual primero
     render_manual_multimerge_board(client=client, selected_site=selected_site, site_tickets=site_tickets)
 
-    # IA opcional
     st.divider()
-    st.markdown("## IA (opcional): agrupar tickets similares (solo Open + Unassigned)")
 
-    eligible, _non = split_tickets_eligible(site_tickets)
-    st.caption(f"Elegibles para IA: {len(eligible)} (Open + Unassigned).")
+    # 2) Híbrido: heurístico + IA (solo sobre elegibles)
+    st.markdown("## 🤖 Agrupar (Heurístico + IA) — rápido y más barato")
 
-    if st.button("Agrupar con IA", type="primary"):
-        if len(eligible) < 2:
-            st.warning("No hay suficientes tickets elegibles (Open + Unassigned) para agrupar con IA.")
-        else:
-            try:
-                ai = group_tickets_with_ai(eligible)
+    eligible = [t for t in site_tickets if eligible_for_ai(t)]
+    st.caption(f"Elegibles para IA (Open + Unassigned + Requester=ServiceDesk): {len(eligible)} / {len(site_tickets)}")
+
+    cA, cB, cC = st.columns([1, 1, 1])
+    with cA:
+        fuzzy_threshold = st.slider("Umbral fuzzy (heurístico)", 0.70, 0.98, 0.90, 0.01)
+    with cB:
+        max_candidates = st.number_input("Máx. grupos candidatos enviados a IA", min_value=5, max_value=200, value=60, step=5)
+    with cC:
+        show_debug = st.checkbox("Debug heurístico", value=False)
+
+    if st.button("Agrupar (Heurístico + IA)", type="primary", disabled=len(eligible) < 2):
+        try:
+            # A) Heurístico
+            cand = build_candidate_groups(
+                eligible,
+                fuzzy_threshold=float(fuzzy_threshold),
+                max_candidates=int(max_candidates),
+            )
+            candidate_payload = []
+            for g in cand:
+                tickets_in_group = [compact_ticket_for_ai(t) for t in eligible if str(t.get("id")) in set(g.ids)]
+                # asegurar 2+
+                if len(tickets_in_group) >= 2:
+                    candidate_payload.append({"reason_hint": g.reason, "tickets": tickets_in_group})
+
+            if show_debug:
+                st.write(f"Candidatos heurísticos: {len(candidate_payload)}")
+                st.json(candidate_payload[:3])
+
+            if not candidate_payload:
+                st.warning("Heurístico no encontró candidatos con los filtros actuales.")
+            else:
+                # B) IA: solo jerarquía/padre/hijos dentro de candidatos
+                ai = refine_candidate_groups_with_ai(site_name=selected_site, candidate_groups=candidate_payload)
                 groups = ai.get("groups", [])
-                groups = normalize_groups_choose_parent(groups, eligible)
-                st.session_state["ai_groups"] = groups
-                st.success(f"IA generó {len(groups)} grupos (solo elegibles).")
-            except AIError as e:
-                st.error(str(e))
 
-    groups = st.session_state.get("ai_groups") or []
+                # Guardar por sitio
+                all_groups_by_site: Dict[str, List[dict]] = st.session_state.get("ai_groups_by_site", {}) or {}
+                all_groups_by_site[selected_site] = groups
+                st.session_state["ai_groups_by_site"] = all_groups_by_site
+
+                st.success(f"IA devolvió {len(groups)} grupos.")
+
+        except AIError as e:
+            st.error(str(e))
+
+    groups_by_site: Dict[str, List[dict]] = st.session_state.get("ai_groups_by_site", {}) or {}
+    groups = groups_by_site.get(selected_site, []) or []
+
     if not groups:
+        st.info("Aún no has generado grupos con IA para este sitio.")
         st.stop()
 
-    st.success(f"Grupos IA actuales: {len(groups)}")
+    st.markdown("### Grupos propuestos por IA (revisar antes de merge)")
+    by_id = {str(t.get("id")): t for t in site_tickets}
 
-    by_id = {str(t.get("id")): t for t in eligible}
-
-    for i, g in enumerate(groups, start=1):
+    for idx, g in enumerate(groups, start=1):
         if not isinstance(g, dict):
             continue
 
@@ -753,25 +518,23 @@ with tab_site:
         if parent_id:
             ids.append(parent_id)
         ids.extend([x for x in child_ids if x and x != parent_id])
+        # mantener solo ids que aún existen
         ids = [x for x in ids if x in by_id]
 
-        with st.expander(f"Grupo #{i} ({len(ids)} tickets) — {reason}", expanded=False):
+        if len(ids) < 2:
+            continue
+
+        with st.expander(f"Grupo #{idx} ({len(ids)} tickets) — {reason}", expanded=False):
             rows = [by_id[x] for x in ids]
             st.dataframe(rows, use_container_width=True, height=220)
 
-            if not ids:
-                st.warning("Grupo vacío: IDs no están en el universo elegible (quizá ya fueron mergeados).")
-                continue
+            default_parent = parent_id if parent_id in ids else min(ids, key=_to_int_id)
 
-            is_done = bool(g.get("merged_done")) or ("MERGED_DONE" in reason)
-
-            default_parent = parent_id if parent_id in ids else ids[0]
             new_parent = st.selectbox(
                 "Elegir padre (ticket principal)",
                 options=ids,
                 index=ids.index(default_parent),
-                key=f"ai_parent_sel_{i}",
-                disabled=is_done,
+                key=f"ai_parent_sel__{selected_site}__{idx}",
             )
 
             selectable_children = [x for x in ids if x != new_parent]
@@ -779,31 +542,20 @@ with tab_site:
                 "Selecciona hijos a mergear en este padre",
                 options=selectable_children,
                 default=selectable_children,
-                key=f"ai_children_sel_{i}",
-                disabled=is_done,
+                key=f"ai_children_sel__{selected_site}__{idx}",
             )
 
-            do_merge = st.button(
-                "MERGEAR este grupo",
-                type="primary",
-                key=f"ai_merge_btn_{i}",
-                disabled=is_done,
-            )
-
-            if do_merge:
+            if st.button("MERGEAR este grupo", type="primary", key=f"ai_merge_btn__{selected_site}__{idx}"):
                 if not new_parent or not selected_children:
                     st.warning("Necesitas un padre y al menos 1 hijo.")
                 else:
                     try:
-                        res = client.merge_requests(parent_id=new_parent, child_ids=selected_children)
+                        _res = client.merge_requests(parent_id=new_parent, child_ids=selected_children)
                         st.success(f"Merge OK. Padre={new_parent}, hijos={selected_children}")
-                        st.json(res)
 
                         apply_merge_local_update(client, selected_site, new_parent, selected_children)
-                        update_ai_groups_after_merge(new_parent, selected_children)
+                        update_groups_after_merge(selected_site, new_parent, selected_children)
 
-                        # ✅ al hacer merge, el tablero manual (arriba) se actualiza automáticamente porque usa site_tickets en session_state
                         st.rerun()
-
                     except ServiceDeskApiError as e:
                         st.error(str(e))
