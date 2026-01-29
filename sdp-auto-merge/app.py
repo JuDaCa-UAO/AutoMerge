@@ -2,22 +2,17 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Any, Dict, List
+from collections import defaultdict
+from difflib import SequenceMatcher
 
 import streamlit as st
 
 from servicedesk_merge.config import load_settings, SettingsError
 from servicedesk_merge.sdp_client import ServiceDeskClient, ServiceDeskApiError
-from servicedesk_merge.ai_gpt import refine_candidate_groups_with_ai, AIError
-from servicedesk_merge.heuristic_helper import (
-    build_candidate_groups,
-    normalize_subject,
-    requester_is_servicedesk,
-    status_is_open,
-    technician_is_unassigned,
-)
+from servicedesk_merge.ai_gpt import group_tickets_with_ai, AIError
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+CAM_RANGE_RE = re.compile(r"\b(cam(?:era)?s?)\s*([0-9]{1,3})(?:\s*[-–]\s*([0-9]{1,3}))?\b", re.I)
 
 
 # ----------------------------- Helpers -----------------------------
@@ -92,13 +87,6 @@ def derive_sites_from_tickets(tickets: list[dict]) -> list[str]:
     return sorted({t.get("site", "").strip() for t in tickets if t.get("site", "").strip()})
 
 
-def _to_int_id(x: str) -> int:
-    try:
-        return int(str(x).strip())
-    except Exception:
-        return 10**18
-
-
 def remove_ids_from_list(tickets: list[dict], ids_to_remove: set[str]) -> list[dict]:
     return [t for t in tickets if str(t.get("id", "")).strip() not in ids_to_remove]
 
@@ -135,10 +123,7 @@ def apply_merge_local_update(client: ServiceDeskClient, site_name: str, parent_i
 
     pool = st.session_state.get("pool_data", []) or []
     src_pool = st.session_state.get("site_source_pool", []) or pool
-
-    # site cache (por sitio)
-    site_cache: Dict[str, List[dict]] = st.session_state.get("site_cache", {}) or {}
-    site_list = site_cache.get(site_name, []) or []
+    site_list = st.session_state.get("site_tickets", []) or []
 
     pool = remove_ids_from_list(pool, child_set)
     src_pool = remove_ids_from_list(src_pool, child_set)
@@ -153,211 +138,458 @@ def apply_merge_local_update(client: ServiceDeskClient, site_name: str, parent_i
 
     st.session_state["pool_data"] = pool
     st.session_state["site_source_pool"] = src_pool
-    site_cache[site_name] = site_list
-    st.session_state["site_cache"] = site_cache
+    st.session_state["site_tickets"] = site_list
 
 
-def update_groups_after_merge(site_name: str, parent_id: str, child_ids: list[str]) -> None:
-    """
-    Remapea grupos IA localmente sin volver a llamar IA.
-    """
+def update_ai_groups_after_merge(parent_id: str, child_ids: list[str]) -> None:
+    groups = st.session_state.get("ai_groups")
+    if not isinstance(groups, list) or not groups:
+        return
+
+    parent_id = str(parent_id).strip()
     merged_children = {str(x).strip() for x in child_ids if str(x).strip()}
-    merged_children.discard(str(parent_id).strip())
-
-    all_groups_by_site: Dict[str, List[dict]] = st.session_state.get("ai_groups_by_site", {}) or {}
-    groups = all_groups_by_site.get(site_name, []) or []
+    merged_children.discard(parent_id)
 
     new_groups = []
     for g in groups:
         if not isinstance(g, dict):
             continue
+
+        reason = str(g.get("reason", "") or "")
         g_parent = str(g.get("parent_id", "") or "").strip()
         g_children = [str(x).strip() for x in (g.get("child_ids") or []) if str(x).strip()]
-        g_children = [c for c in g_children if c not in merged_children and c != g_parent]
 
-        # si el padre fue mergeado como hijo en otra operación, marcar para revisión (no borramos)
+        if reason == "ALL_TICKETS_NO_MERGE":
+            new_groups.append(g)
+            continue
+
+        g_children_filtered = [cid for cid in g_children if cid not in merged_children]
+
+        if g_parent == parent_id:
+            g2 = dict(g)
+            g2["child_ids"] = g_children_filtered
+            g2["merged_done"] = True
+            if "MERGED_DONE" not in g2.get("reason", ""):
+                g2["reason"] = f"{reason} | MERGED_DONE"
+            new_groups.append(g2)
+            continue
+
         if g_parent in merged_children:
             g2 = dict(g)
-            g2["child_ids"] = g_children
-            g2["reason"] = (g2.get("reason", "") or "") + " | PARENT_WAS_MERGED_REVIEW"
+            g2["child_ids"] = g_children_filtered
+            g2["merged_done"] = True
+            if "PARENT_WAS_MERGED_REVIEW" not in g2.get("reason", ""):
+                g2["reason"] = f"{reason} | PARENT_WAS_MERGED_REVIEW"
             new_groups.append(g2)
             continue
 
         g2 = dict(g)
-        g2["child_ids"] = g_children
+        g2["child_ids"] = g_children_filtered
         new_groups.append(g2)
 
-    all_groups_by_site[site_name] = new_groups
-    st.session_state["ai_groups_by_site"] = all_groups_by_site
+    st.session_state["ai_groups"] = new_groups
 
 
-def eligible_for_ai(t: dict) -> bool:
-    return (
-        status_is_open(t.get("status", ""))
-        and technician_is_unassigned(t.get("technician", ""))
-        and requester_is_servicedesk(t.get("requester", ""))
-    )
+def _to_int_id(x: str) -> int:
+    try:
+        return int(str(x).strip())
+    except Exception:
+        return 10**18
 
 
-def compact_ticket_for_ai(t: dict) -> dict:
-    return {
-        "id": str(t.get("id", "")).strip(),
-        "subject": str(t.get("subject", "")).strip(),
-        "created": str(t.get("created", "")).strip(),
-        "status": str(t.get("status", "")).strip(),
-        "requester": str(t.get("requester", "")).strip(),
-        "technician": str(t.get("technician", "")).strip(),
+def _extract_ips(subject: str) -> set[str]:
+    return set(IP_RE.findall(subject or ""))
+
+
+def _extract_last_octets(subject: str) -> list[int]:
+    ips = IP_RE.findall(subject or "")
+    out = []
+    for ip in ips:
+        parts = ip.split(".")
+        if len(parts) == 4:
+            try:
+                out.append(int(parts[3]))
+            except Exception:
+                pass
+    return out
+
+
+def _infer_device_type(ticket: dict) -> str:
+    """
+    Clasificador simple por subject + IP rules.
+    Tipos: router, sw_core, sw_secondary, radio, ap, sm, sw_tertiary, camera, nvr, da, unknown
+    """
+    subj = (ticket.get("subject") or "").lower()
+    ips = _extract_ips(subj)
+    octets = _extract_last_octets(subj)
+
+    # IP-specific
+    if "192.168.1.254" in ips or "router" in subj or "gateway" in subj or " gw" in subj:
+        return "router"
+
+    # NVR
+    if "192.168.1.103" in ips or "nvr" in subj:
+        return "nvr"
+
+    # DA (Digital Acoustics)
+    if any(ip.startswith("192.168.1.20") for ip in ips) or "digital acoustics" in subj or " da" in subj:
+        return "da"
+
+    # Switch 100/Core: .10x last octet 100-109
+    if any(100 <= o <= 109 for o in octets) or "switch 100" in subj or "sw100" in subj or "core switch" in subj:
+        return "sw_core"
+
+    # Camera keywords
+    if "camera" in subj or re.search(r"\bcam\b", subj):
+        return "camera"
+
+    # Radio
+    if "radio" in subj:
+        return "radio"
+
+    # AP/SM IP inference on 192.168.0.*
+    # AP ~ last octet ends with 0 and between 10-99 (10,20,30,...)
+    if any(ip.startswith("192.168.0.") for ip in ips):
+        for o in octets:
+            if 10 <= o <= 99:
+                if o % 10 == 0:
+                    return "ap"
+                if o % 10 == 1:
+                    return "sm"
+
+    # Text keywords
+    if re.search(r"(^|\s)ap(\s|$)", subj):
+        return "ap"
+    if re.search(r"(^|\s)sm(\s|$)", subj):
+        return "sm"
+
+    # Switches (generic)
+    if "switch" in subj or re.search(r"\bsw\b", subj):
+        # sin más contexto lo tratamos como secundario (distribución)
+        return "sw_secondary"
+
+    # Tertiary hints
+    if "tertiary" in subj or "tercer" in subj or "access switch" in subj or "switch 3" in subj or "sw3" in subj:
+        return "sw_tertiary"
+
+    return "unknown"
+
+
+def _device_rank(ticket: dict) -> int:
+    """
+    Menor rank = más arriba (mejor candidato a padre)
+
+    Jerarquía ajustada (como pediste):
+    Router -> Switch100/Core -> Switch secundario -> Radio -> AP -> SM -> Switch terciario -> Endpoints (Cam/NVR/DA) -> Unknown
+    """
+    t = _infer_device_type(ticket)
+    order = {
+        "router": 0,
+        "sw_core": 1,
+        "sw_secondary": 2,
+        "radio": 3,
+        "ap": 4,
+        "sm": 5,
+        "sw_tertiary": 6,
+        "camera": 7,
+        "nvr": 7,
+        "da": 7,
+        "unknown": 8,
     }
+    return order.get(t, 8)
 
 
-# ----------------------------- Manual board UI -----------------------------
-def render_manual_multimerge_board(
-    *,
-    client: ServiceDeskClient,
-    selected_site: str,
-    site_tickets: list[dict],
-) -> None:
-    """
-    Multi-merge manual:
-    - por defecto te muestra solo Open+Unassigned
-    - puedes incluir asignados si lo necesitas (checkbox)
-    """
-    st.markdown("### 📌 Compilado (todos los tickets del sitio) + Multi-merge manual")
+def normalize_groups_choose_parent(groups: list[dict], tickets: list[dict]) -> list[dict]:
+    by_id = {str(t.get("id")): t for t in tickets}
 
-    include_assigned = st.checkbox(
-        "Incluir tickets con technician asignado (solo para merge manual)",
-        value=False,
-        key=f"include_assigned__{selected_site}",
-        help="La IA seguirá siendo estricta, pero tú puedes mergear manualmente si lo necesitas.",
+    new_groups: list[dict] = []
+    for g in groups or []:
+        if not isinstance(g, dict):
+            continue
+
+        reason = str(g.get("reason", "") or "")
+        if reason == "ALL_TICKETS_NO_MERGE":
+            new_groups.append(g)
+            continue
+
+        parent_id = str(g.get("parent_id", "") or "").strip()
+        child_ids = [str(x).strip() for x in (g.get("child_ids") or []) if str(x).strip()]
+
+        ids = []
+        if parent_id:
+            ids.append(parent_id)
+        ids.extend(child_ids)
+
+        uniq = []
+        for x in ids:
+            if x and x not in uniq and x in by_id:
+                uniq.append(x)
+
+        if len(uniq) < 2:
+            continue
+
+        best = None
+        best_key = None
+        for tid in uniq:
+            t = by_id.get(tid, {})
+            key = (_device_rank(t), _to_int_id(tid))
+            if best is None or key < best_key:
+                best = tid
+                best_key = key
+
+        new_parent = best
+        new_children = [x for x in uniq if x != new_parent]
+
+        g2 = dict(g)
+        g2["parent_id"] = new_parent
+        g2["child_ids"] = new_children
+        new_groups.append(g2)
+
+    return new_groups
+
+
+def ensure_compiled_group(groups: list[dict], tickets: list[dict]) -> list[dict]:
+    cleaned = []
+    for g in (groups or []):
+        if isinstance(g, dict) and str(g.get("reason", "")).strip() != "ALL_TICKETS_NO_MERGE":
+            cleaned.append(g)
+
+    numeric_ids = []
+    for t in tickets or []:
+        tid = str(t.get("id", "")).strip()
+        try:
+            numeric_ids.append(int(tid))
+        except Exception:
+            pass
+    parent_id = str(min(numeric_ids)) if numeric_ids else ""
+
+    cleaned.append(
+        {
+            "reason": "ALL_TICKETS_NO_MERGE",
+            "parent_id": parent_id,
+            "child_ids": [],
+            "confidence": 1.0,
+            "needs_review": False,
+            "evidence": ["all_tickets_board"],
+        }
     )
+    return cleaned
 
-    # Scope para merge manual (para que sea práctico)
-    if include_assigned:
-        manual_scope = [t for t in site_tickets if (t.get("status", "").strip().lower() == "open")]
-    else:
-        manual_scope = [t for t in site_tickets if eligible_for_ai(t)]
 
-    excluded_count = len(site_tickets) - len(manual_scope)
-    st.caption(f"Tickets disponibles en tablero manual: {len(manual_scope)} (excluidos por filtros: {excluded_count})")
+def build_default_best_parent(all_ids: list[str], by_id: dict[str, dict]) -> str | None:
+    best = None
+    best_key = None
+    for tid in all_ids:
+        t = by_id.get(tid, {})
+        key = (_device_rank(t), _to_int_id(tid))
+        if best is None or key < best_key:
+            best = tid
+            best_key = key
+    return best
 
-    compiled = sorted(manual_scope, key=lambda t: _to_int_id(t.get("id", "")))
-    st.dataframe(compiled, use_container_width=True, height=300)
 
-    all_ids = [str(t.get("id")) for t in compiled if str(t.get("id", "")).strip()]
-    if len(all_ids) < 2:
-        st.info("No hay suficientes tickets en el scope actual para hacer merges manuales.")
-        return
+def _eligible_for_ai_merge(t: dict) -> bool:
+    status = (t.get("status") or "").strip().lower()
+    technician = (t.get("technician") or "").strip().lower()
+    requester = (t.get("requester") or "").strip()
 
-    # Plan por sitio
-    plan_by_site: Dict[str, Dict[str, List[str]]] = st.session_state.get("manual_plan_by_site", {}) or {}
-    plan = plan_by_site.get(selected_site, {}) or {}
+    is_open = status == "open"
+    tech_unassigned = technician in ("", "unassigned", "none", "-", "null")
+    req_ok = requester == "ServiceDesk"
+    return is_open and tech_unassigned and req_ok
 
-    parents_key = f"manual_parents__{selected_site}"
 
-    parents = st.multiselect(
-        "Selecciona uno o varios PADRES",
-        options=all_ids,
-        default=[p for p in plan.keys() if p in all_ids],
-        key=parents_key,
-    )
+def _has_explicit_cam_reference(sm_or_ap_subject: str) -> bool:
+    # basta con que el subject mencione cam/cameras con números/rangos
+    return bool(CAM_RANGE_RE.search(sm_or_ap_subject or ""))
 
-    # limpiar plan si quitaron padres (NO tocar session_state del widget, solo el plan)
-    plan = {p: kids for p, kids in plan.items() if p in parents}
 
-    # evitar hijos repetidos en distintos padres
-    used_children = set()
-    for p, kids in plan.items():
-        for k in kids:
-            used_children.add(k)
+def post_validate_ai_groups(groups: list[dict], tickets: list[dict]) -> list[dict]:
+    """
+    Barandas duras:
+    - evita SM/AP con Cam/NVR/DA por coincidencia de número
+    - solo permite cruzar si comparten IP completa o SM/AP menciona explícitamente cams en su subject
+    - evita que un ticket aparezca en múltiples grupos
+    - elimina grupos <2
+    """
+    by_id = {str(t.get("id")): t for t in tickets}
+    used: set[str] = set()
+    out: list[dict] = []
 
-    st.markdown("#### Asignación de hijos por cada padre")
-    for p in parents:
-        other_parents = set(parents) - {p}
-        current = [x for x in (plan.get(p, []) or []) if x in all_ids]
+    for g in groups or []:
+        if not isinstance(g, dict):
+            continue
 
-        available = [
-            x for x in all_ids
-            if x != p and x not in other_parents and x not in (used_children - set(current))
-        ]
+        reason = str(g.get("reason", "") or "").strip()
+        if reason == "ALL_TICKETS_NO_MERGE":
+            out.append(g)
+            continue
 
-        # limpiar current con available
-        current = [x for x in current if x in available]
+        parent_id = str(g.get("parent_id", "") or "").strip()
+        child_ids = [str(x).strip() for x in (g.get("child_ids") or []) if str(x).strip()]
 
-        kids = st.multiselect(
-            f"Hijos para el padre {p}",
-            options=available,
-            default=current,
-            key=f"manual_children__{selected_site}__{p}",
-        )
+        ids = []
+        if parent_id:
+            ids.append(parent_id)
+        ids.extend([x for x in child_ids if x and x != parent_id])
 
-        # actualizar used_children
-        for x in plan.get(p, []) or []:
-            used_children.discard(x)
-        for x in kids:
-            used_children.add(x)
+        # limpiar inexistentes
+        ids = [x for x in ids if x in by_id]
 
-        plan[p] = kids
+        # evitar que un ticket esté en más de un grupo
+        ids = [x for x in ids if x not in used]
 
-    plan_by_site[selected_site] = plan
-    st.session_state["manual_plan_by_site"] = plan_by_site
+        if len(ids) < 2:
+            continue
 
-    st.markdown("#### Resumen del plan")
-    summary = [{"parent": p, "children": ", ".join(kids), "children_count": len(kids)} for p, kids in plan.items() if kids]
-    if summary:
-        st.dataframe(summary, use_container_width=True, height=160)
-    else:
-        st.info("Aún no has asignado hijos a ningún padre.")
+        # detectar tipos
+        types = {tid: _infer_device_type(by_id[tid]) for tid in ids}
+        has_sm_ap = any(types[tid] in ("sm", "ap") for tid in ids)
+        has_cam_family = any(types[tid] in ("camera", "nvr", "da") for tid in ids)
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("🧹 Limpiar plan manual", type="secondary", key=f"clear_plan__{selected_site}"):
-            plan_by_site[selected_site] = {}
-            st.session_state["manual_plan_by_site"] = plan_by_site
-            st.rerun()
+        if has_sm_ap and has_cam_family:
+            # permitir cruce solo con evidencia fuerte:
+            # A) IP completa compartida con alguien en el grupo
+            # B) subject del SM/AP menciona explícitamente cams
+            ips_map = {tid: _extract_ips(by_id[tid].get("subject", "")) for tid in ids}
 
-    with c2:
-        if st.button(
-            "🚀 Ejecutar merges del plan manual",
-            type="primary",
-            key=f"run_plan__{selected_site}",
-            disabled=not bool(summary),
-        ):
-            ok, fail = 0, 0
-            # ejecutar en orden por ID (más viejo primero)
-            operations = [(p, plan[p]) for p in plan.keys() if plan.get(p)]
-            operations.sort(key=lambda x: _to_int_id(x[0]))
+            # IP compartida (al menos 1 ip en común entre tickets)
+            shared_ip_tickets = set()
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    a, b = ids[i], ids[j]
+                    if ips_map[a] and ips_map[b] and (ips_map[a] & ips_map[b]):
+                        shared_ip_tickets.add(a)
+                        shared_ip_tickets.add(b)
 
-            current_ids = {str(t.get("id")) for t in site_tickets}
-            for parent_id, child_ids in operations:
-                child_ids = [c for c in child_ids if c in current_ids and c != parent_id]
-                if not child_ids:
-                    continue
+            explicit_cam_ok = set()
+            for tid in ids:
+                if types[tid] in ("sm", "ap"):
+                    if _has_explicit_cam_reference(by_id[tid].get("subject", "")):
+                        explicit_cam_ok.add(tid)
 
-                try:
-                    _res = client.merge_requests(parent_id=parent_id, child_ids=child_ids)
-                    ok += 1
+            # tickets permitidos:
+            # - si es sm/ap, solo puede quedarse si tiene shared ip o explicit cam reference
+            # - si es cam/nvr/da, solo puede quedarse si comparte ip con alguien (no por número)
+            filtered = []
+            for tid in ids:
+                ttype = types[tid]
+                if ttype in ("sm", "ap"):
+                    if tid in shared_ip_tickets or tid in explicit_cam_ok:
+                        filtered.append(tid)
+                elif ttype in ("camera", "nvr", "da"):
+                    if tid in shared_ip_tickets:
+                        filtered.append(tid)
+                else:
+                    # switches/radio: se mantienen, pero no “conectan” por número
+                    filtered.append(tid)
 
-                    apply_merge_local_update(client, selected_site, parent_id, child_ids)
-                    update_groups_after_merge(selected_site, parent_id, child_ids)
+            # Si al filtrar se rompe el grupo, lo partimos por familias (sm/ap vs cam family) sin cruzar
+            if len(filtered) < 2:
+                # split por tipo
+                smap = [tid for tid in ids if types[tid] in ("sm", "ap", "sw_secondary", "sw_core", "sw_tertiary", "radio", "router")]
+                camfam = [tid for tid in ids if types[tid] in ("camera", "nvr", "da")]
 
-                    # actualizar universe local (para siguientes operaciones)
-                    current_ids -= set(child_ids)
+                # mantenemos cada subgrupo si tiene >=2
+                for sub in (smap, camfam):
+                    sub = [x for x in sub if x not in used]
+                    if len(sub) >= 2:
+                        # padre por ranking + id menor
+                        best = min(sub, key=lambda x: (_device_rank(by_id[x]), _to_int_id(x)))
+                        children = [x for x in sub if x != best]
+                        g2 = dict(g)
+                        g2["parent_id"] = best
+                        g2["child_ids"] = children
+                        g2["reason"] = f"{reason} | POST_SPLIT_SM_CAM"
+                        out.append(g2)
+                        used.update(sub)
+                continue
 
-                except ServiceDeskApiError as e:
-                    fail += 1
-                    st.error(f"Fallo merge padre={parent_id} hijos={child_ids}\n{e}")
+            ids = filtered
 
-            st.success(f"Listo. Merges OK: {ok}, fallidos: {fail}")
+        if len(ids) < 2:
+            continue
 
-            # limpiar plan del sitio (sin tocar widget keys)
-            plan_by_site[selected_site] = {}
-            st.session_state["manual_plan_by_site"] = plan_by_site
-            st.rerun()
+        # recomputar padre con jerarquía local (si IA se equivocó)
+        best = min(ids, key=lambda x: (_device_rank(by_id[x]), _to_int_id(x)))
+        children = [x for x in ids if x != best]
+
+        g2 = dict(g)
+        g2["parent_id"] = best
+        g2["child_ids"] = children
+        out.append(g2)
+        used.update(ids)
+
+    return out
+
+
+def fallback_groups_no_ai(site_tickets: list[dict]) -> list[dict]:
+    """
+    Si IA devuelve vacío: generamos grupos básicos:
+    - exact subject normalizado
+    - misma IP completa
+    """
+    by_id = {str(t.get("id")): t for t in site_tickets}
+    norm = lambda s: " ".join((s or "").strip().lower().split())
+
+    buckets_exact = defaultdict(list)
+    buckets_ip = defaultdict(list)
+
+    for t in site_tickets:
+        tid = str(t.get("id", "")).strip()
+        subj = str(t.get("subject", "")).strip()
+        if not tid or not subj:
+            continue
+        buckets_exact[norm(subj)].append(tid)
+        for ip in _extract_ips(subj):
+            buckets_ip[ip].append(tid)
+
+    groups = []
+
+    # exact subject
+    for k, ids in buckets_exact.items():
+        if len(ids) >= 2:
+            best = min(ids, key=lambda x: (_device_rank(by_id[x]), _to_int_id(x)))
+            children = [x for x in ids if x != best]
+            groups.append(
+                {
+                    "reason": "FALLBACK_EXACT_SUBJECT",
+                    "parent_id": best,
+                    "child_ids": children,
+                    "confidence": 0.75,
+                    "needs_review": True,
+                    "evidence": ["exact_subject_fallback"],
+                }
+            )
+
+    # same IP (solo si no está ya incluido por exact)
+    used_ids = set()
+    for g in groups:
+        used_ids.add(g["parent_id"])
+        used_ids.update(g["child_ids"])
+
+    for ip, ids in buckets_ip.items():
+        ids = [x for x in ids if x not in used_ids]
+        if len(ids) >= 2:
+            best = min(ids, key=lambda x: (_device_rank(by_id[x]), _to_int_id(x)))
+            children = [x for x in ids if x != best]
+            groups.append(
+                {
+                    "reason": f"FALLBACK_SAME_IP:{ip}",
+                    "parent_id": best,
+                    "child_ids": children,
+                    "confidence": 0.8,
+                    "needs_review": True,
+                    "evidence": [f"same_ip_fallback:{ip}"],
+                }
+            )
+
+    return groups
 
 
 # ----------------------------- UI -----------------------------
-st.set_page_config(page_title="SDP Auto-Merge (Hybrid)", layout="wide")
-st.title("SDP Auto-Merge (Heurístico + IA)")
+st.set_page_config(page_title="SDP Loader + IA", layout="wide")
+st.title("SDP Loader + IA")
 
 try:
     settings = load_settings()
@@ -373,7 +605,7 @@ except SettingsError as e:
     st.info("Crea un .env basado en .env.example y vuelve a ejecutar.")
     st.stop()
 
-tab_pool, tab_site = st.tabs(["📥 Pool general", "🏢 Por sitio (híbrido)"])
+tab_pool, tab_site = st.tabs(["📥 Pool general", "🏢 Por sitio + IA + merge"])
 
 # ---------------- TAB 1 ----------------
 with tab_pool:
@@ -393,8 +625,8 @@ with tab_pool:
         try:
             st.session_state["pool_data"] = fetch_pool(client, int(pool_size), int(page_size), int(start_index))
             st.session_state["site_source_pool"] = st.session_state["pool_data"]
-            st.session_state["site_cache"] = {}  # cache por sitio
-            st.success("Pool cargado.")
+            st.session_state["site_tickets"] = []
+            st.session_state["ai_groups"] = []
         except (ServiceDeskApiError, ValueError) as e:
             st.error(str(e))
 
@@ -411,7 +643,7 @@ with tab_pool:
 
 # ---------------- TAB 2 ----------------
 with tab_site:
-    st.subheader("Por sitio (heurístico + IA) + merge revisado")
+    st.subheader("Por sitio (sin /sites) + IA + merge")
 
     src_pool = st.session_state.get("site_source_pool", [])
     if not src_pool:
@@ -425,92 +657,187 @@ with tab_site:
 
     selected_site = st.selectbox("Selecciona un sitio", options=sites)
 
-    # cargar tickets del sitio desde cache o desde pool
-    site_cache: Dict[str, List[dict]] = st.session_state.get("site_cache", {}) or {}
-    if selected_site not in site_cache:
-        site_cache[selected_site] = [t for t in src_pool if t.get("site") == selected_site]
-        st.session_state["site_cache"] = site_cache
-
-    site_tickets = site_cache.get(selected_site, []) or []
-    if not site_tickets:
-        st.info("Este sitio no tiene tickets en el pool cargado.")
-        st.stop()
-
-    st.markdown("### Tickets del sitio (referencia)")
-    st.dataframe(sorted(site_tickets, key=lambda t: _to_int_id(t.get("id", ""))), use_container_width=True, height=280)
-
-    st.divider()
-
-    # 1) SIEMPRE mostrar tablero manual primero
-    render_manual_multimerge_board(client=client, selected_site=selected_site, site_tickets=site_tickets)
-
-    st.divider()
-
-    # 2) Híbrido: heurístico + IA (solo sobre elegibles)
-    st.markdown("## 🤖 Agrupar (Heurístico + IA) — rápido y más barato")
-
-    eligible = [t for t in site_tickets if eligible_for_ai(t)]
-    st.caption(f"Elegibles para IA (Open + Unassigned + Requester=ServiceDesk): {len(eligible)} / {len(site_tickets)}")
+    # Reset manual plan si cambia el sitio
+    if st.session_state.get("manual_plan_site") != selected_site:
+        st.session_state["manual_plan_site"] = selected_site
+        st.session_state["manual_plan"] = {}
+        st.session_state["manual_parents"] = []
+        st.session_state["ai_groups"] = []
 
     cA, cB, cC = st.columns([1, 1, 1])
     with cA:
-        fuzzy_threshold = st.slider("Umbral fuzzy (heurístico)", 0.70, 0.98, 0.90, 0.01)
+        max_to_show = st.number_input("Máximo a mostrar en tabla", min_value=50, max_value=10000, value=2000, step=50)
     with cB:
-        max_candidates = st.number_input("Máx. grupos candidatos enviados a IA", min_value=5, max_value=200, value=60, step=5)
+        refresh_after_merge = st.checkbox("Refrescar padre desde API al merge", value=True)
     with cC:
-        show_debug = st.checkbox("Debug heurístico", value=False)
+        show_only_open_unassigned = st.checkbox("Mostrar solo Open + Unassigned (recomendado)", value=True)
 
-    if st.button("Agrupar (Heurístico + IA)", type="primary", disabled=len(eligible) < 2):
-        try:
-            # A) Heurístico
-            cand = build_candidate_groups(
-                eligible,
-                fuzzy_threshold=float(fuzzy_threshold),
-                max_candidates=int(max_candidates),
+    if st.button("Cargar tickets de este sitio", type="primary"):
+        site_all = [t for t in src_pool if t.get("site") == selected_site]
+        if show_only_open_unassigned:
+            site_all = [t for t in site_all if (t.get("status") or "").strip().lower() == "open" and (t.get("technician") or "").strip().lower() in ("", "unassigned", "none", "-", "null")]
+        st.session_state["site_tickets"] = site_all[: int(max_to_show)]
+        st.success(f"Tickets en '{selected_site}': {len(site_all)} (mostrando {len(st.session_state['site_tickets'])})")
+
+    site_tickets = st.session_state.get("site_tickets", [])
+    if not site_tickets:
+        st.stop()
+
+    st.markdown("### Tickets del sitio")
+    st.dataframe(site_tickets, use_container_width=True, height=420)
+
+    st.divider()
+
+    # ✅ Tablero manual SIEMPRE visible (sin necesidad de IA)
+    st.markdown("## 📌 Compilado (todos los tickets) + Multi-merge manual")
+    by_id = {str(t.get("id")): t for t in site_tickets}
+    compiled = sorted(site_tickets, key=lambda t: _to_int_id(t.get("id", "")))
+    st.dataframe(compiled, use_container_width=True, height=300)
+
+    all_ids = [str(t.get("id")) for t in compiled if str(t.get("id", "")).strip()]
+    if len(all_ids) >= 2:
+        suggested_parent = build_default_best_parent(all_ids, by_id)
+        default_parents = [suggested_parent] if suggested_parent in all_ids else []
+
+        parents = st.multiselect(
+            "Selecciona uno o varios PADRES",
+            options=all_ids,
+            default=st.session_state.get("manual_parents", default_parents) or default_parents,
+            key="manual_parents",
+        )
+
+        plan: dict[str, list[str]] = st.session_state.get("manual_plan", {}) or {}
+        plan = {p: kids for p, kids in plan.items() if p in parents}
+
+        used_children = set()
+        for p, kids in plan.items():
+            for k in kids:
+                used_children.add(k)
+
+        st.markdown("### Asignación de hijos por cada padre")
+        for p in parents:
+            other_parents = set(parents) - {p}
+            available = [
+                x for x in all_ids
+                if x != p and x not in other_parents and x not in (used_children - set(plan.get(p, [])))
+            ]
+
+            current = [x for x in (plan.get(p, []) or []) if x in available]
+            kids = st.multiselect(
+                f"Hijos para el padre {p}",
+                options=available,
+                default=current,
+                key=f"manual_children_{p}",
             )
-            candidate_payload = []
-            for g in cand:
-                tickets_in_group = [compact_ticket_for_ai(t) for t in eligible if str(t.get("id")) in set(g.ids)]
-                # asegurar 2+
-                if len(tickets_in_group) >= 2:
-                    candidate_payload.append({"reason_hint": g.reason, "tickets": tickets_in_group})
 
-            if show_debug:
-                st.write(f"Candidatos heurísticos: {len(candidate_payload)}")
-                st.json(candidate_payload[:3])
+            for x in plan.get(p, []):
+                used_children.discard(x)
+            for x in kids:
+                used_children.add(x)
 
-            if not candidate_payload:
-                st.warning("Heurístico no encontró candidatos con los filtros actuales.")
-            else:
-                # B) IA: solo jerarquía/padre/hijos dentro de candidatos
-                ai = refine_candidate_groups_with_ai(site_name=selected_site, candidate_groups=candidate_payload)
-                groups = ai.get("groups", [])
+            plan[p] = kids
 
-                # Guardar por sitio
-                all_groups_by_site: Dict[str, List[dict]] = st.session_state.get("ai_groups_by_site", {}) or {}
-                all_groups_by_site[selected_site] = groups
-                st.session_state["ai_groups_by_site"] = all_groups_by_site
+        st.session_state["manual_plan"] = plan
 
-                st.success(f"IA devolvió {len(groups)} grupos.")
+        st.markdown("### Resumen del plan de merges")
+        summary_rows = []
+        for p, kids in plan.items():
+            if kids:
+                summary_rows.append({"parent": p, "children_count": len(kids), "children": ", ".join(kids)})
+
+        if summary_rows:
+            st.dataframe(summary_rows, use_container_width=True, height=180)
+        else:
+            st.info("Aún no has asignado hijos a ningún padre.")
+
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("🧹 Limpiar plan", type="secondary"):
+                st.session_state["manual_plan"] = {}
+                st.session_state["manual_parents"] = []
+                st.rerun()
+
+        with c2:
+            run_all = st.button("🚀 Ejecutar merges del plan", type="primary", disabled=not bool(summary_rows))
+
+        if run_all:
+            def parent_sort_key(pid: str):
+                t = by_id.get(pid, {})
+                return (_device_rank(t), _to_int_id(pid))
+
+            operations = [(p, plan[p]) for p in plan.keys() if plan.get(p)]
+            operations.sort(key=lambda x: parent_sort_key(x[0]))
+
+            ok_count = 0
+            fail_count = 0
+
+            for parent_id, child_ids in operations:
+                current_ids = {str(t.get("id")) for t in st.session_state.get("site_tickets", [])}
+                child_ids = [c for c in child_ids if c in current_ids and c != parent_id]
+                if not child_ids:
+                    continue
+
+                try:
+                    _res = client.merge_requests(parent_id=parent_id, child_ids=child_ids)
+                    ok_count += 1
+
+                    apply_merge_local_update(client, selected_site, parent_id, child_ids)
+                    update_ai_groups_after_merge(parent_id, child_ids)
+
+                except ServiceDeskApiError as e:
+                    fail_count += 1
+                    st.error(f"Fallo merge padre={parent_id} hijos={child_ids}\n{e}")
+
+            st.success(f"Listo. Merges OK: {ok_count}, fallidos: {fail_count}")
+            st.session_state["manual_plan"] = {}
+            st.session_state["manual_parents"] = []
+            st.rerun()
+
+    st.divider()
+    st.markdown("## 🤖 IA: agrupar tickets similares (posibles duplicados)")
+
+    if st.button("Agrupar con IA"):
+        try:
+            # Puedes pasar todos los tickets mostrados; la IA prioriza elegibles, y tu app valida
+            ai = group_tickets_with_ai(site_tickets, site_name=selected_site)
+            groups = ai.get("groups", []) or []
+
+            # Normaliza padre con jerarquía local
+            groups = normalize_groups_choose_parent(groups, site_tickets)
+
+            # Asegura tablero compilado al final
+            groups = ensure_compiled_group(groups, site_tickets)
+
+            # Post-validación anti-alucinación (SM/AP vs Cam/NVR/DA)
+            groups = post_validate_ai_groups(groups, site_tickets)
+
+            # Si aún quedó vacío, fallback sin IA (para no mostrar "nada")
+            real_groups = [g for g in groups if isinstance(g, dict) and str(g.get("reason", "")) != "ALL_TICKETS_NO_MERGE"]
+            if not real_groups:
+                fb = fallback_groups_no_ai(site_tickets)
+                groups = fb + ensure_compiled_group([], site_tickets)
+
+            st.session_state["ai_groups"] = groups
 
         except AIError as e:
             st.error(str(e))
 
-    groups_by_site: Dict[str, List[dict]] = st.session_state.get("ai_groups_by_site", {}) or {}
-    groups = groups_by_site.get(selected_site, []) or []
-
+    groups = st.session_state.get("ai_groups")
     if not groups:
-        st.info("Aún no has generado grupos con IA para este sitio.")
         st.stop()
 
-    st.markdown("### Grupos propuestos por IA (revisar antes de merge)")
-    by_id = {str(t.get("id")): t for t in site_tickets}
+    st.success(f"Grupos actuales: {len(groups)}")
 
-    for idx, g in enumerate(groups, start=1):
+    # Render de grupos IA
+    for i, g in enumerate(groups, start=1):
         if not isinstance(g, dict):
             continue
 
         reason = str(g.get("reason", "") or "").strip()
+        if reason == "ALL_TICKETS_NO_MERGE":
+            # ya tenemos el tablero manual arriba, no repetimos aquí
+            continue
+
         parent_id = str(g.get("parent_id", "") or "").strip()
         child_ids = [str(x).strip() for x in (g.get("child_ids") or []) if str(x).strip()]
 
@@ -518,23 +845,41 @@ with tab_site:
         if parent_id:
             ids.append(parent_id)
         ids.extend([x for x in child_ids if x and x != parent_id])
-        # mantener solo ids que aún existen
         ids = [x for x in ids if x in by_id]
 
-        if len(ids) < 2:
-            continue
+        conf = g.get("confidence", None)
+        needs_review = bool(g.get("needs_review", False))
+        evidence = g.get("evidence", []) or []
 
-        with st.expander(f"Grupo #{idx} ({len(ids)} tickets) — {reason}", expanded=False):
+        title_bits = [f"Grupo #{i}", f"{len(ids)} tickets", reason]
+        if conf is not None:
+            try:
+                title_bits.append(f"conf={float(conf):.2f}")
+            except Exception:
+                pass
+        if needs_review:
+            title_bits.append("NEEDS_REVIEW")
+
+        with st.expander(" — ".join(title_bits), expanded=False):
+            if evidence:
+                st.caption("Evidencia (IA): " + " | ".join([str(x) for x in evidence][:12]))
+
             rows = [by_id[x] for x in ids]
             st.dataframe(rows, use_container_width=True, height=220)
 
-            default_parent = parent_id if parent_id in ids else min(ids, key=_to_int_id)
+            if not ids:
+                st.warning("Grupo vacío: IDs no están en la tabla actual (quizá ya fueron mergeados).")
+                continue
 
+            is_done = bool(g.get("merged_done")) or ("MERGED_DONE" in reason)
+
+            default_parent = parent_id if parent_id in ids else ids[0]
             new_parent = st.selectbox(
                 "Elegir padre (ticket principal)",
                 options=ids,
                 index=ids.index(default_parent),
-                key=f"ai_parent_sel__{selected_site}__{idx}",
+                key=f"parent_sel_{i}",
+                disabled=is_done,
             )
 
             selectable_children = [x for x in ids if x != new_parent]
@@ -542,20 +887,31 @@ with tab_site:
                 "Selecciona hijos a mergear en este padre",
                 options=selectable_children,
                 default=selectable_children,
-                key=f"ai_children_sel__{selected_site}__{idx}",
+                key=f"children_sel_{i}",
+                disabled=is_done,
             )
 
-            if st.button("MERGEAR este grupo", type="primary", key=f"ai_merge_btn__{selected_site}__{idx}"):
+            do_merge = st.button(
+                "MERGEAR este grupo",
+                type="primary",
+                key=f"merge_btn_{i}",
+                disabled=is_done,
+            )
+
+            if do_merge:
                 if not new_parent or not selected_children:
                     st.warning("Necesitas un padre y al menos 1 hijo.")
                 else:
                     try:
-                        _res = client.merge_requests(parent_id=new_parent, child_ids=selected_children)
+                        res = client.merge_requests(parent_id=new_parent, child_ids=selected_children)
                         st.success(f"Merge OK. Padre={new_parent}, hijos={selected_children}")
+                        st.json(res)
 
                         apply_merge_local_update(client, selected_site, new_parent, selected_children)
-                        update_groups_after_merge(selected_site, new_parent, selected_children)
+
+                        update_ai_groups_after_merge(new_parent, selected_children)
 
                         st.rerun()
+
                     except ServiceDeskApiError as e:
                         st.error(str(e))
