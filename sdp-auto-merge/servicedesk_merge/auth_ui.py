@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from servicedesk_merge.auth_store import get_token, save_token
+from servicedesk_merge.auth_store import encryption_available, get_token, save_token
 
 _LANG = {
     "es": {
@@ -19,6 +19,7 @@ _LANG = {
         "user_required": "Debes ingresar un usuario.",
         "token_required": "Debes pegar tu token de ServiceDesk.",
         "loaded_from_device": "Token cargado desde este equipo.",
+        "enc_missing": "No hay clave de cifrado; el token no se guardara en este equipo.",
     },
     "en": {
         "header": "Login / Session",
@@ -34,6 +35,7 @@ _LANG = {
         "user_required": "Please enter a username.",
         "token_required": "Please paste your ServiceDesk token.",
         "loaded_from_device": "Token loaded from this device.",
+        "enc_missing": "Missing encryption key; token will not be saved on this device.",
     },
 }
 
@@ -97,7 +99,12 @@ def render_login_panel() -> tuple[str, str] | None:
                 return None
 
         if remember:
-            save_token(user, token_value)
+            if not encryption_available():
+                st.sidebar.warning(_t("enc_missing"))
+            else:
+                saved = save_token(user, token_value)
+                if not saved:
+                    st.sidebar.warning(_t("enc_missing"))
 
         st.session_state["auth_user"] = user
         st.session_state["auth_token"] = token_value
