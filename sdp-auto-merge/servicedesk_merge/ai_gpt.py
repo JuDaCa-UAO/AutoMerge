@@ -14,11 +14,6 @@ class AIError(RuntimeError):
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
-try:
-    import streamlit as st
-except Exception:  # pragma: no cover - optional outside Streamlit
-    st = None
-
 
 def _normalize_subject(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
@@ -107,13 +102,6 @@ def _build_candidate_groups(compact: List[Dict[str, Any]]) -> Dict[str, List[Lis
 
 
 def _get_setting(name: str) -> str | None:
-    if st is not None:
-        try:
-            val = st.secrets.get(name)
-            if val is not None:
-                return str(val)
-        except Exception:
-            pass
     val = os.getenv(name)
     if val is None:
         return None
@@ -135,7 +123,7 @@ def group_tickets_with_ai(
     site_context = str(site_context or "").strip()
 
     if not api_key:
-        raise AIError("Falta OPENAI_API_KEY en Secrets o variables de entorno.")
+        raise AIError("Falta OPENAI_API_KEY en tu .env")
 
     client = OpenAI(api_key=api_key)
 

@@ -3,10 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-try:
-    import streamlit as st
-except Exception:  # pragma: no cover - optional outside Streamlit
-    st = None
+from dotenv import load_dotenv
 
 
 class SettingsError(RuntimeError):
@@ -29,13 +26,6 @@ def _parse_bool(v: str | None, default: bool) -> bool:
 
 
 def _get_setting(name: str) -> str | None:
-    if st is not None:
-        try:
-            val = st.secrets.get(name)
-            if val is not None:
-                return str(val)
-        except Exception:
-            pass
     val = os.getenv(name)
     if val is None:
         return None
@@ -43,6 +33,8 @@ def _get_setting(name: str) -> str | None:
 
 
 def load_settings() -> Settings:
+    load_dotenv()
+
     base_url = (_get_setting("SDP_API_BASE_URL") or "").strip()
     portal_id = (_get_setting("SDP_PORTAL_ID") or "").strip() or None
     verify_ssl = _parse_bool(_get_setting("SDP_VERIFY_SSL"), default=True)
