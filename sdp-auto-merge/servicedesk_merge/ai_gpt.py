@@ -14,6 +14,11 @@ class AIError(RuntimeError):
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
+try:
+    import streamlit as st
+except Exception:  # pragma: no cover - optional outside Streamlit
+    st = None
+
 
 def _normalize_subject(s: str) -> str:
     return " ".join((s or "").strip().lower().split())
@@ -101,6 +106,17 @@ def _build_candidate_groups(compact: List[Dict[str, Any]]) -> Dict[str, List[Lis
     }
 
 
+def _get_setting(name: str) -> str | None:
+    if st is not None:
+        try:
+            val = st.secrets.get(name)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return os.getenv(name)
+
+
 def group_tickets_with_ai(
     tickets: List[Dict[str, Any]],
     *,
@@ -111,12 +127,12 @@ def group_tickets_with_ai(
     Devuelve:
       {"groups":[{"reason","parent_id","child_ids","confidence","needs_review","evidence"}]}
     """
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    model = (os.getenv("OPENAI_MODEL") or "gpt-4.1").strip()
+    api_key = (_get_setting("OPENAI_API_KEY") or "").strip()
+    model = (_get_setting("OPENAI_MODEL") or "gpt-4.1").strip()
     site_context = str(site_context or "").strip()
 
     if not api_key:
-        raise AIError("Falta OPENAI_API_KEY en tu .env")
+        raise AIError("Falta OPENAI_API_KEY en Secrets o variables de entorno.")
 
     client = OpenAI(api_key=api_key)
 

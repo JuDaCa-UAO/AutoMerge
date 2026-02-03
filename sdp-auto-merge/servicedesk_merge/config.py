@@ -3,7 +3,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from dotenv import load_dotenv
+try:
+    import streamlit as st
+except Exception:  # pragma: no cover - optional outside Streamlit
+    st = None
 
 
 class SettingsError(RuntimeError):
@@ -25,13 +28,22 @@ def _parse_bool(v: str | None, default: bool) -> bool:
     return s in ("1", "true", "yes", "y", "on")
 
 
-def load_settings() -> Settings:
-    load_dotenv()
+def _get_setting(name: str) -> str | None:
+    if st is not None:
+        try:
+            val = st.secrets.get(name)
+            if val is not None:
+                return val
+        except Exception:
+            pass
+    return os.getenv(name)
 
-    base_url = (os.getenv("SDP_API_BASE_URL") or "").strip()
-    portal_id = (os.getenv("SDP_PORTAL_ID") or "").strip() or None
-    verify_ssl = _parse_bool(os.getenv("SDP_VERIFY_SSL"), default=True)
-    timeout_s_raw = (os.getenv("SDP_TIMEOUT_SECONDS") or "30").strip()
+
+def load_settings() -> Settings:
+    base_url = (_get_setting("SDP_API_BASE_URL") or "").strip()
+    portal_id = (_get_setting("SDP_PORTAL_ID") or "").strip() or None
+    verify_ssl = _parse_bool(_get_setting("SDP_VERIFY_SSL"), default=True)
+    timeout_s_raw = (_get_setting("SDP_TIMEOUT_SECONDS") or "30").strip()
 
     if not base_url:
         raise SettingsError("Falta SDP_API_BASE_URL en variables de entorno.")
