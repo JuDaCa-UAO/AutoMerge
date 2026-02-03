@@ -33,10 +33,13 @@ def _get_setting(name: str) -> str | None:
         try:
             val = st.secrets.get(name)
             if val is not None:
-                return val
+                return str(val)
         except Exception:
             pass
-    return os.getenv(name)
+    val = os.getenv(name)
+    if val is None:
+        return None
+    return str(val)
 
 
 def load_settings() -> Settings:
