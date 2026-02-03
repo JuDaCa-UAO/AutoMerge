@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import math
-import time
 import re
 from collections import defaultdict
 from difflib import SequenceMatcher
 
 import streamlit as st
 
+from servicedesk_merge.auth_ui import render_login_panel
 from servicedesk_merge.config import load_settings, SettingsError
 from servicedesk_merge.sdp_client import ServiceDeskClient, ServiceDeskApiError
 from servicedesk_merge.ai_gpt import group_tickets_with_ai, AIError
 
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-CAM_RANGE_RE = re.compile(r"\b(cam(?:era)?s?)\s*([0-9]{1,3})(?:\s*[-–]\s*([0-9]{1,3}))?\b", re.I)
+CAM_RANGE_RE = re.compile(r"\b(cam(?:era)?s?|camaras?)\s*([0-9]{1,3})(?:\s*[-???]\s*([0-9]{1,3}))?\b", re.I)
+SM_RANGE_RE = re.compile(r"\bsm(?:s)?\s*([0-9]{1,3})(?:\s*[-???]\s*([0-9]{1,3}))?\b", re.I)
 
 
 # ----------------------------- Helpers -----------------------------
@@ -66,6 +67,7 @@ def format_reason(reason: str, lang: str) -> str:
         "SAME_IP": "Misma IP",
         "SIMILAR_SUBJECT": "Asunto similar",
         "CAMERA_REF_BY_SWITCH": "Cámaras referenciadas por el switch",
+        "SM_REF_BY_SWITCH": "SMs referenciados por el switch",
         "CAMERA_REF_BY_SM": "Cámaras del mismo SM",
         "FALLBACK_EXACT_SUBJECT": "Mismo asunto (regla local)",
         "MERGED_DONE": "Merge realizado",
@@ -77,6 +79,7 @@ def format_reason(reason: str, lang: str) -> str:
         "SAME_IP": "Same IP",
         "SIMILAR_SUBJECT": "Similar subject",
         "CAMERA_REF_BY_SWITCH": "Cameras referenced by switch",
+        "SM_REF_BY_SWITCH": "SMs referenced by switch",
         "CAMERA_REF_BY_SM": "Cameras from the same SM",
         "FALLBACK_EXACT_SUBJECT": "Same subject (local rule)",
         "MERGED_DONE": "Merge completed",
@@ -103,24 +106,6 @@ def ticket_label(by_id: dict[str, dict], tid: str, max_len: int = 80) -> str:
     subject = str(t.get("subject", "")).strip()
     short = subject[:max_len] + ("..." if len(subject) > max_len else "")
     return f"{tid} - {short}" if short else tid
-
-
-def start_merge_lock() -> None:
-    st.session_state["merge_in_progress"] = True
-    st.session_state["merge_started_at"] = time.time()
-
-
-def clear_merge_lock_if_stale(max_seconds: int = 120) -> None:
-    started = st.session_state.get("merge_started_at")
-    if not started:
-        return
-    try:
-        if time.time() - float(started) > max_seconds:
-            st.session_state["merge_in_progress"] = False
-            st.session_state["merge_started_at"] = None
-    except Exception:
-        st.session_state["merge_in_progress"] = False
-        st.session_state["merge_started_at"] = None
 
 
 def fetch_pool(client: ServiceDeskClient, pool_size: int, page_size: int, start_index: int) -> list[dict]:
@@ -317,7 +302,7 @@ def _infer_device_type(ticket: dict) -> str:
         return "sw_core"
 
     # Camera keywords
-    if "camera" in subj or re.search(r"\bcam\b", subj):
+    if "camera" in subj or "camara" in subj or re.search(r"\bcam\b", subj):
         return "camera"
 
     # Radio
@@ -505,6 +490,49 @@ def _extract_cam_numbers(subject: str) -> set[int]:
         else:
             out.add(start)
     return out
+
+
+def _extract_sm_numbers(subject: str) -> set[int]:
+    """
+    Extrae numeros de SM desde patrones como:
+    "SM 21", "SM 10-12", "SMs 3-5"
+    """
+    out: set[int] = set()
+    for _m in SM_RANGE_RE.finditer(subject or ""):
+        try:
+            start = int(_m.group(1))
+        except Exception:
+            continue
+        end_raw = _m.group(2)
+        if end_raw:
+            try:
+                end = int(end_raw)
+            except Exception:
+                end = start
+            if end < start:
+                start, end = end, start
+            for n in range(start, end + 1):
+                out.add(n)
+        else:
+            out.add(start)
+    return out
+
+
+def _sm_ips_from_subject(subject: str) -> set[str]:
+    ips = _extract_ips(subject)
+    return {ip for ip in ips if ip.startswith("192.168.0.")}
+
+
+def _sm_numbers_from_ticket(ticket: dict) -> set[int]:
+    nums = set(_extract_sm_numbers(ticket.get("subject", "") or ""))
+    for ip in _sm_ips_from_subject(ticket.get("subject", "") or ""):
+        parts = ip.split(".")
+        if len(parts) == 4:
+            try:
+                nums.add(int(parts[3]))
+            except Exception:
+                pass
+    return nums
 
 
 def _camera_numbers_from_ticket(ticket: dict) -> set[int]:
@@ -712,7 +740,7 @@ def groups_from_switch_camera_reference(
     existing_groups: list[dict],
 ) -> list[dict]:
     """
-    Si un switch menciona camaras en su subject, agrupa esas camaras con el switch.
+    Si un switch menciona camaras o SMs en su subject, agrupa esos tickets con el switch.
     Solo agrega grupos nuevos sin reutilizar tickets ya usados.
     """
     by_id = {str(t.get("id")): t for t in site_tickets}
@@ -720,17 +748,25 @@ def groups_from_switch_camera_reference(
 
     camera_by_num: dict[int, list[str]] = defaultdict(list)
     camera_by_ip: dict[str, list[str]] = defaultdict(list)
+    sm_by_num: dict[int, list[str]] = defaultdict(list)
+    sm_by_ip: dict[str, list[str]] = defaultdict(list)
     for t in site_tickets:
         tid = str(t.get("id", "")).strip()
         if not tid:
             continue
-        if _infer_device_type(t) != "camera":
-            continue
-        nums = _camera_numbers_from_ticket(t)
-        for n in nums:
-            camera_by_num[n].append(tid)
-        for ip in _camera_ips_from_subject(t.get("subject", "") or ""):
-            camera_by_ip[ip].append(tid)
+        ttype = _infer_device_type(t)
+        if ttype == "camera":
+            nums = _camera_numbers_from_ticket(t)
+            for n in nums:
+                camera_by_num[n].append(tid)
+            for ip in _camera_ips_from_subject(t.get("subject", "") or ""):
+                camera_by_ip[ip].append(tid)
+        if ttype == "sm":
+            nums = _sm_numbers_from_ticket(t)
+            for n in nums:
+                sm_by_num[n].append(tid)
+            for ip in _sm_ips_from_subject(t.get("subject", "") or ""):
+                sm_by_ip[ip].append(tid)
 
     groups: list[dict] = []
     for t in site_tickets:
@@ -740,9 +776,12 @@ def groups_from_switch_camera_reference(
         ttype = _infer_device_type(t)
         if ttype not in ("sw_core", "sw_secondary", "sw_tertiary"):
             continue
+
         cam_nums = _extract_cam_numbers(t.get("subject", "") or "")
         cam_ips = _camera_ips_from_subject(t.get("subject", "") or "")
-        if not cam_nums and not cam_ips:
+        sm_nums = _extract_sm_numbers(t.get("subject", "") or "")
+        sm_ips = _sm_ips_from_subject(t.get("subject", "") or "")
+        if not cam_nums and not cam_ips and not sm_nums and not sm_ips:
             continue
 
         related: list[str] = []
@@ -750,6 +789,10 @@ def groups_from_switch_camera_reference(
             related.extend(camera_by_num.get(n, []))
         for ip in cam_ips:
             related.extend(camera_by_ip.get(ip, []))
+        for n in sm_nums:
+            related.extend(sm_by_num.get(n, []))
+        for ip in sm_ips:
+            related.extend(sm_by_ip.get(ip, []))
         related = [x for x in dict.fromkeys(related) if x not in used and x != tid]
 
         ids = [tid] + related
@@ -758,14 +801,23 @@ def groups_from_switch_camera_reference(
 
         parent = min(ids, key=lambda x: (_device_rank(by_id.get(x, {})), _to_int_id(x)))
         children = [x for x in ids if x != parent]
+        reason_parts = []
+        evidence = []
+        if cam_nums or cam_ips:
+            reason_parts.append("CAMERA_REF_BY_SWITCH")
+            evidence.append("switch_camera_reference")
+        if sm_nums or sm_ips:
+            reason_parts.append("SM_REF_BY_SWITCH")
+            evidence.append("switch_sm_reference")
+
         groups.append(
             {
-                "reason": "CAMERA_REF_BY_SWITCH",
+                "reason": " | ".join(reason_parts),
                 "parent_id": parent,
                 "child_ids": children,
                 "confidence": 0.7,
                 "needs_review": True,
-                "evidence": ["switch_camera_reference"],
+                "evidence": evidence,
             }
         )
         used.update(ids)
@@ -802,6 +854,90 @@ def _filter_groups_without_overlap(groups: list[dict], used: set[str]) -> list[d
         out.append(g2)
         used.update(ids)
     return out
+
+
+def _merge_overlapping_groups(groups: list[dict], tickets: list[dict]) -> list[dict]:
+    by_id = {str(t.get("id")): t for t in tickets}
+    pending: list[tuple[set[str], dict]] = []
+
+    for g in groups or []:
+        if not isinstance(g, dict):
+            continue
+        reason = str(g.get("reason", "") or "").strip()
+        if reason == "ALL_TICKETS_NO_MERGE":
+            continue
+        parent_id = str(g.get("parent_id", "") or "").strip()
+        child_ids = [str(x).strip() for x in (g.get("child_ids") or []) if str(x).strip()]
+        ids = []
+        if parent_id:
+            ids.append(parent_id)
+        ids.extend([x for x in child_ids if x and x != parent_id])
+        ids = [x for x in ids if x in by_id]
+        if len(ids) < 2:
+            continue
+        pending.append((set(ids), g))
+
+    merged: list[dict] = []
+
+    while pending:
+        ids, seed = pending.pop(0)
+        reason_parts: list[str] = []
+        evidence: list[str] = []
+        confidences: list[float] = []
+        needs_review = False
+
+        def _add_reason(reason: str) -> None:
+            for part in [p.strip() for p in reason.split("|") if p.strip()]:
+                if part not in reason_parts:
+                    reason_parts.append(part)
+
+        def _absorb(g: dict) -> None:
+            nonlocal needs_review
+            r = str(g.get("reason", "") or "").strip()
+            if r:
+                _add_reason(r)
+            for ev in g.get("evidence", []) or []:
+                evs = str(ev).strip()
+                if evs and evs not in evidence:
+                    evidence.append(evs)
+            try:
+                conf = float(g.get("confidence"))
+                confidences.append(conf)
+            except Exception:
+                pass
+            if bool(g.get("needs_review", False)):
+                needs_review = True
+
+        _absorb(seed)
+        i = 0
+        while i < len(pending):
+            ids2, g2 = pending[i]
+            if ids & ids2:
+                ids |= ids2
+                _absorb(g2)
+                pending.pop(i)
+                continue
+            i += 1
+
+        all_ids = [x for x in ids if x in by_id]
+        if len(all_ids) < 2:
+            continue
+
+        parent = min(all_ids, key=lambda x: (_device_rank(by_id.get(x, {})), _to_int_id(x)))
+        children = [x for x in all_ids if x != parent]
+        confidence = min(confidences) if confidences else 0.7
+        merged.append(
+            {
+                "reason": " | ".join(reason_parts),
+                "parent_id": parent,
+                "child_ids": children,
+                "confidence": confidence,
+                "needs_review": needs_review,
+                "evidence": evidence,
+            }
+        )
+
+    return merged
 
 
 def groups_from_sm_camera_reference(
@@ -891,6 +1027,8 @@ LANG = {
         "need_pool": "Primero carga un pool en la pestaña 'Pool general'.",
         "no_sites": "No pude derivar sitios desde el pool (campo 'site' vacío).",
         "select_site": "Selecciona un sitio",
+        "site_context_label": "Contexto de red del sitio (opcional)",
+        "site_context_placeholder": "Ej: subredes/zonas, IPs especiales (router, NVR), cámaras en 192.168.2.x, etc.",
         "max_show": "Máximo a mostrar en tabla",
         "refresh_parent": "Refrescar padre desde API al merge",
         "only_open": "Mostrar solo Open y Unassigned (recomendado)",
@@ -918,6 +1056,9 @@ LANG = {
         "pool_loaded": "Tickets en '{site}': {total} (mostrando {shown})",
         "need_parent_child": "Necesitas un padre y al menos 1 hijo.",
         "merge_busy": "Hay un merge en curso. Espera a que termine para continuar.",
+        "login_required": "Debes iniciar sesion.",
+        "login_invalid": "Token invalido o sin permisos.",
+        "login_validation_error": "No se pudo validar el token. Detalle: {error}",
     },
     "en": {
         "app_title": "SDP Auto Merge",
@@ -939,6 +1080,8 @@ LANG = {
         "need_pool": "Load a pool first in the 'General pool' tab.",
         "no_sites": "Could not derive sites from the pool (empty 'site' field).",
         "select_site": "Select a site",
+        "site_context_label": "Site network context (optional)",
+        "site_context_placeholder": "e.g., subnets/zones, special IPs (router, NVR), cameras on 192.168.2.x, etc.",
         "max_show": "Max to show in table",
         "refresh_parent": "Refresh parent from API after merge",
         "only_open": "Show only Open and Unassigned (recommended)",
@@ -966,6 +1109,9 @@ LANG = {
         "pool_loaded": "Tickets in '{site}': {total} (showing {shown})",
         "need_parent_child": "You need a parent and at least 1 child.",
         "merge_busy": "A merge is in progress. Please wait until it finishes.",
+        "login_required": "You must sign in.",
+        "login_invalid": "Invalid token or insufficient permissions.",
+        "login_validation_error": "Token validation failed. Detail: {error}",
     },
 }
 
@@ -983,17 +1129,36 @@ st.title(t("app_title"))
 
 try:
     settings = load_settings()
-    client = ServiceDeskClient(
-        base_url=settings.api_base_url,
-        auth_token=settings.auth_token,
-        portal_id=settings.portal_id,
-        verify_ssl=settings.verify_ssl,
-        timeout_seconds=settings.timeout_seconds,
-    )
 except SettingsError as e:
     st.error(t("env_error").format(error=e))
     st.info(t("env_info"))
     st.stop()
+
+auth = render_login_panel()
+if not auth:
+    st.warning(t("login_required"))
+    st.stop()
+
+_username, token = auth
+client = ServiceDeskClient(
+    base_url=settings.api_base_url,
+    auth_token=token,
+    portal_id=settings.portal_id,
+    verify_ssl=settings.verify_ssl,
+    timeout_seconds=settings.timeout_seconds,
+)
+
+if st.session_state.get("auth_validated_for") != token:
+    try:
+        client.list_requests_page(start_index=1, row_count=1)
+        st.session_state["auth_validated_for"] = token
+    except ServiceDeskApiError as e:
+        msg = str(e)
+        if " 401 " in msg or " 403 " in msg or "401" in msg or "403" in msg:
+            st.sidebar.error(t("login_invalid"))
+        else:
+            st.sidebar.error(t("login_validation_error").format(error=e))
+        st.stop()
 
 tab_pool, tab_site = st.tabs([t("tab_pool"), t("tab_site")])
 
@@ -1033,7 +1198,6 @@ with tab_pool:
 
 # ---------------- TAB 2 ----------------
 with tab_site:
-    clear_merge_lock_if_stale()
     st.subheader(t("sub_site"))
 
     src_pool = st.session_state.get("site_source_pool", [])
@@ -1054,6 +1218,15 @@ with tab_site:
         st.session_state.pop("manual_parent_single", None)
         st.session_state.pop("manual_children_single", None)
         st.session_state["ai_groups"] = []
+
+    site_context_key = f"site_context_{selected_site}"
+    site_context = st.text_area(
+        t("site_context_label"),
+        value=st.session_state.get(site_context_key, ""),
+        placeholder=t("site_context_placeholder"),
+        height=110,
+    )
+    st.session_state[site_context_key] = site_context
 
     cA, cB, cC = st.columns([1, 1, 1])
     with cA:
@@ -1112,17 +1285,12 @@ with tab_site:
             key="manual_children_single",
         )
 
-        merge_busy = bool(st.session_state.get("merge_in_progress"))
         apply_merge = st.button(
             t("apply_merge"),
             type="primary",
-            disabled=merge_busy or (not bool(child_ids)),
+            disabled=(not bool(child_ids)),
         )
         if apply_merge:
-            if st.session_state.get("merge_in_progress"):
-                st.info(t("merge_busy"))
-                st.stop()
-            start_merge_lock()
             try:
                 _res = client.merge_requests(parent_id=parent_id, child_ids=child_ids)
                 st.success(t("merge_done").format(parent=parent_id, children=child_ids))
@@ -1131,8 +1299,6 @@ with tab_site:
             except ServiceDeskApiError as e:
                 st.error(t("merge_failed").format(error=e))
             finally:
-                st.session_state["merge_in_progress"] = False
-                st.session_state["merge_started_at"] = None
                 st.rerun()
     else:
         st.info(t("need_two"))
@@ -1143,7 +1309,7 @@ with tab_site:
     if st.button(t("ai_button")):
         try:
             # Puedes pasar todos los tickets mostrados; la IA prioriza elegibles, y tu app valida
-            ai = group_tickets_with_ai(site_tickets, site_name=selected_site)
+            ai = group_tickets_with_ai(site_tickets, site_name=selected_site, site_context=site_context)
             groups = ai.get("groups", []) or []
 
             # Normaliza padre con jerarquía local
@@ -1156,6 +1322,7 @@ with tab_site:
             hierarchy_groups = []
             hierarchy_groups.extend(groups_from_sm_camera_reference(site_tickets, groups))
             hierarchy_groups.extend(groups_from_switch_camera_reference(site_tickets, groups))
+            hierarchy_groups = _merge_overlapping_groups(hierarchy_groups, site_tickets)
 
             used: set[str] = set()
             hierarchy_groups = _filter_groups_without_overlap(hierarchy_groups, used)
@@ -1255,22 +1422,17 @@ with tab_site:
                 disabled=is_done,
             )
 
-            merge_busy = bool(st.session_state.get("merge_in_progress"))
             do_merge = st.button(
                 t("merge_group"),
                 type="primary",
                 key=f"merge_btn_{i}",
-                disabled=is_done or merge_busy,
+                disabled=is_done,
             )
 
             if do_merge:
                 if not new_parent or not selected_children:
                     st.warning(t("need_parent_child"))
                 else:
-                    if st.session_state.get("merge_in_progress"):
-                        st.info(t("merge_busy"))
-                        st.stop()
-                    start_merge_lock()
                     try:
                         _res = client.merge_requests(parent_id=new_parent, child_ids=selected_children)
                         st.success(t("merge_done").format(parent=new_parent, children=selected_children))
@@ -1288,6 +1450,4 @@ with tab_site:
                     except ServiceDeskApiError as e:
                         st.error(t("merge_failed").format(error=e))
                     finally:
-                        st.session_state["merge_in_progress"] = False
-                        st.session_state["merge_started_at"] = None
                         st.rerun()

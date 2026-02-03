@@ -33,13 +33,26 @@ def _infer_device_hint(subject: str) -> str:
     subj = (subject or "").lower()
     ips = IP_RE.findall(subj)
 
-    if "192.168.1.254" in ips or "router" in subj or "gateway" in subj or " gw" in subj:
+    if (
+        "192.168.1.254" in ips
+        or "192.168.2.254" in ips
+        or "router" in subj
+        or "gateway" in subj
+        or " gw" in subj
+    ):
         return "router"
-    if "192.168.1.103" in ips or "nvr" in subj:
+    if "192.168.1.103" in ips or "192.168.2.103" in ips or "nvr" in subj:
         return "nvr"
-    if any(ip.startswith("192.168.1.20") for ip in ips) or "digital acoustics" in subj or " da" in subj:
+    if (
+        any(ip.startswith("192.168.1.20") for ip in ips)
+        or any(ip.startswith("192.168.2.20") for ip in ips)
+        or "digital acoustics" in subj
+        or " da" in subj
+    ):
         return "da"
-    if "camera" in subj or re.search(r"\bcam\b", subj):
+    if "camera" in subj or "camara" in subj or re.search(r"\bcam\b", subj):
+        return "camera"
+    if any(ip.startswith("192.168.1.") for ip in ips) or any(ip.startswith("192.168.2.") for ip in ips):
         return "camera"
     if "radio" in subj:
         return "radio"
@@ -92,6 +105,7 @@ def group_tickets_with_ai(
     tickets: List[Dict[str, Any]],
     *,
     site_name: str = "",
+    site_context: str = "",
 ) -> Dict[str, Any]:
     """
     Devuelve:
@@ -99,6 +113,7 @@ def group_tickets_with_ai(
     """
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     model = (os.getenv("OPENAI_MODEL") or "gpt-4.1").strip()
+    site_context = str(site_context or "").strip()
 
     if not api_key:
         raise AIError("Falta OPENAI_API_KEY en tu .env")
@@ -190,22 +205,21 @@ REGLA PARA SM Y CAMARAS:
   siempre que los tickets de camaras coincidan por numero, rango o IP.
 
 PATRONES IP (contexto):
-- Cámaras: 192.168.1.x (Puede ser 192.168.2.x pero raro. No consideres como camara las otras ips reservadas que puedan caer dentro de este rango como los NVR o DA)
+- Cámaras: 192.168.1.x o 192.168.2.x (algunos sitios tienen múltiples zonas o solo 192.168.2.x)
 - AP: 192.168.0.xx (xx típicamente decenas: 10,20,30,...)
 - SM asociado suele ser AP+1: 0.10 -> 0.11; 0.20 -> 0.21
-- NVR: 192.168.1.103
-- Router: 192.168.1.254
-- DA: 192.168.1.20x (200,201,203,...)
+- NVR: 192.168.1.103 o 192.168.2.103
+- Router: 192.168.1.254 o 192.168.2.254
+- DA: 192.168.1.20x o 192.168.2.20x (200,201,203,...)
 
-AGRUPACI?N (orden):
-1) Relaciones expl?citas de jerarqu?a (switch/SM con c?maras referenciadas)
+AGRUPACIÓN (orden):
+1) Relaciones explícitas de jerarquía (switch/SM con cámaras referenciadas)
 2) Duplicados exactos (subject igual normalizando espacios y may/min)
 3) Misma IPv4 completa
 4) Similaridad fuerte de subject (mismo tipo de dispositivo). Si es probable pero no seguro => needs_review=true
-5) Jerarqu?a designada (ver abajo) para elegir PADRE.
-
+5) Jerarquía designada (ver abajo) para elegir PADRE.
 PRIORIDAD:
-- Si ya agrupaste c?maras con su SM o switch por referencia expl?cita, no vuelvas a agrupar esas c?maras en otros grupos.
+- Si ya agrupaste cámaras con su SM o switch por referencia explícita, no vuelvas a agrupar esas cámaras en otros grupos.
 
 SUGERENCIAS CONFIABLES (siempre que no violen reglas):
 - exact_subject_groups: agrupa estos tickets, salvo evidencia clara en contra.
@@ -247,6 +261,8 @@ REGLA EXTRA:
   evidence=["all_tickets_board"]
 
 SITIO: {site_name}
+CONTEXTO DE RED (opcional, provisto por usuario):
+{site_context}
 
 Cada ticket incluye:
 - subject_norm (subject normalizado)
